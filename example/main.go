@@ -45,7 +45,7 @@ func (this simpleHandler) Handle(lower, upper int64) {
 }
 
 const (
-	bufferSize = 1024 * 64
+	bufferSize   = 1024 * 64
 	bufferMask   = bufferSize - 1
 	iterations   = 128 * 1024 * 32
 	reservations = 1
