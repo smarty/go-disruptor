@@ -29,6 +29,67 @@ Apple Silicon (128B lines), both structs fit in a single cache line, which means
 the hot fields straddle the boundary. The code is correct everywhere but the performance optimization only works as
 intended on x86.
 
+### Benchmark 128B sequence padding on Intel
+
+Intel's L2 spatial ("adjacent-line") prefetcher fetches cache lines in 128B-aligned pairs, so two `atomicSequence`
+values on neighboring 64B lines can still interfere even though each sits alone on its own line. `newSequences()`
+allocates all handler sequences contiguously, so adjacent consumers share a 128B pair. The separately allocated
+producer sequences (`newSequence()`) may also land next to one another, depending on the allocator. Java LMAX pads to
+128B on x86 for this reason. On a Threadripper 3970X (Zen 2) the change was neutral: one -9.5% multi-producer result
+did not replicate (see *Performance Findings* in `CLAUDE.md`). It has never been measured on Intel, where the
+prefetcher is documented. Run it on the i7-12700K.
+
+**The experiment** is a single constant. `CacheLineBytes` is only used by `atomicSequence` padding and alignment in
+`sequence.go`, so changing it to `128` in `cpu_padding_64bit.go` changes nothing else. If it wins, don't ship it that
+way: that file also covers arm64-linux, loong64, and riscv64, and the exported constant would no longer mean "cache line
+size". Introduce a separate, amd64-only padding constant for `atomicSequence` instead.
+
+**What to watch:** mainly the multi-consumer rows (`SP MC`, `SP4MC`, `MP MC/*`), where adjacent consumer sequences
+are guaranteed to share a 128B pair; also the multi-producer rows, where any benefit depends on where the allocator put
+the producer sequences.
+
+**Method.** Build both variants as test binaries once, so nothing compiles during timed runs. Pin the benchmarks to
+physical P-cores, turn turbo off, interleave the variants in shuffled order across rounds so machine-state drift spreads
+evenly across them, and compare with `benchstat` (`go install golang.org/x/perf/cmd/benchstat@latest`):
+
+```bash
+git worktree add ../go-disruptor-pad128 HEAD
+sed -i 's/const CacheLineBytes = 64/const CacheLineBytes = 128/' ../go-disruptor-pad128/cpu_padding_64bit.go
+go test -c -o /tmp/base.test . && (cd ../go-disruptor-pad128 && go test -c -o /tmp/pad128.test .)
+
+echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo  # restore with 0 afterwards
+rm -f /tmp/base.txt /tmp/pad128.txt  # results are appended across rounds
+for _round in $(seq 10); do
+	for _variant in $(printf 'base\npad128\n' | shuf); do
+		taskset -c "${_single_producer_cpus}" "/tmp/${_variant}.test" -test.run '^$' -test.count 1 -test.cpu 4 \
+			-test.bench 'Sequencer/(SP|Reserve|NextWrapPoint|Commit)' >> "/tmp/${_variant}.txt"
+		taskset -c "${_multi_producer_cpus}" "/tmp/${_variant}.test" -test.run '^$' -test.count 1 -test.cpu 8 \
+			-test.bench 'SharedSequencer/MP' >> "/tmp/${_variant}.txt"
+	done
+done
+benchstat /tmp/base.txt /tmp/pad128.txt
+git worktree remove ../go-disruptor-pad128
+```
+
+**Choosing CPUs.** The 12700K is hybrid, with 8 P-cores (hyperthreaded) and 4 E-cores. Never let a benchmark land on an
+E-core. Read the layout from `lscpu -e=CPU,CORE,MAXMHZ`: P-core threads report the higher `MAXMHZ`, and SMT siblings
+share a `CORE` value. Use one thread per physical P-core: 4 P-cores for `_single_producer_cpus`, all 8 for
+`_multi_producer_cpus` (the multi-producer benchmarks keep 5-6 goroutines busy).
+
+**Reserving the cores** matters more than pinning. `taskset` only keeps the benchmark on its cores; it doesn't keep
+other processes off them. To move everything else away, run
+`systemctl set-property --runtime <unit> AllowedCPUs=<other cpus>` for `system.slice`, `init.scope`, and `user.slice`.
+Then launch the benchmark through `sudo systemd-run --slice=bench.slice -p AllowedCPUs=<benchmark cpus> --uid=<you>`,
+because a session inside `user.slice` is confined along with everything else. Undoing this has two traps:
+
+- Clearing `AllowedCPUs=` leaves already-running processes with their narrowed affinity. Set it to all CPUs *first*,
+  then clear it.
+- Even that doesn't reach processes under the per-user managers (`user@UID.service`), which have no cpuset delegated.
+  Reset their threads directly with `taskset -cp <all cpus> <tid>`, as root for other users' processes.
+
+**Reading the results.** Single-producer rows were stable to ±0-3% on the Threadripper when the cores were reserved.
+Multi-producer rows are noisier. Only trust a multi-producer delta that survives a second, independent run.
+
 ### Error sentinels as magic int64 values
 
 `ErrReservationSize = -1` and `ErrCapacityUnavailable = -2` are bare int64 constants, not `error` types. A caller that
