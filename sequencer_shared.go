@@ -1,9 +1,6 @@
 package disruptor
 
-import (
-	"math/bits"
-	"sync/atomic"
-)
+import "sync/atomic"
 
 // sharedSequencer is a multi-writer Sequencer that allows multiple goroutines to concurrently reserve slots in the
 // same ring buffer. Unlike defaultSequencer, it is goroutine-safe for concurrent producers. The struct occupies two
@@ -21,18 +18,23 @@ import (
 //     by multiple writers reserving sequences in the ring buffer. But checking this cached value is significantly
 //     less expensive than checking the consumerBarrier field.
 //
-//   - committedSlots: a per-slot commit status array indexed by sequence & mask. Each entry stores the "round"
-//     (sequence >> shift) to indicate that a specific slot has been committed. Commit writes slots from lowest to
-//     highest, and Load reads in the same direction, stopping at the first uncommitted slot to find the highest
-//     contiguously committed sequence. The slice header lives on cache line 1; the backing array is allocated
+//   - committedSlots: a commit marker array indexed by sequence & mask. Commit(lower, upper) stores a single marker,
+//     the batch's upper sequence, in the slot of the batch's *first* sequence; the batch's remaining slots are not
+//     written. Load starts at a batch boundary and jumps from marker to marker (to marker+1), stopping at the first
+//     slot whose marker is less than the sequence being examined, to find the highest contiguously committed
+//     sequence. This costs one atomic store per batch in Commit and one atomic load per batch in Load, rather than
+//     one per slot. A slot examined for sequence s holds either this lap's marker for the batch beginning at s (which
+//     is >= s), or a stale marker from any earlier lap, or the initial -1. A stale marker belongs to a batch that began
+//     at s-k*capacity (k >= 1) and was at most capacity long, so it is always < s; because sequences are int64 and
+//     never wrap, no stale marker can ever be mistaken for a current one, however many laps it survives unwritten.
+//
+//     Correctness relies on Load only ever being called with a lower bound that is the first sequence of a batch.
+//     That holds because every caller passes handledSequence+1, and every handledSequence is either the initial -1
+//     or a value previously returned by Load (directly, or as the minimum across a handler group), all of which are
+//     the last sequence of some batch. The slice header lives on cache line 1; the backing array is allocated
 //     separately but in contiguous memory.
 //
 //   - capacity: the total number of slots in the ring buffer, always a power of 2.
-//
-//   - shift: log2(capacity), used to compute the round number stored in committedSlots on every Commit and Load.
-//     When a producer commits sequence s, it stores int32(s >> shift) at committedSlots[s & mask]. This lets Load
-//     verify that a slot was committed for the correct lap around the ring buffer, not a stale value from a
-//     previous lap of the ring buffer.
 //
 //   - consumerBarrier: a barrier used to determine the slowest sequence position across all downstream consumers.
 //     Only read during the slow-path spin loop when a producer has detected possible overwrite contention.
@@ -43,10 +45,9 @@ type sharedSequencer struct {
 	// cache line 1 — hot path (Reserve/Commit/Load)
 	reservedSequence       *atomicSequence // 8B  — atomic Add every Reserve; read every Load
 	cachedConsumerSequence *atomicSequence // 8B  — read every Reserve (wrap check)
-	committedSlots         []atomic.Int32  // 24B — Store every Commit; scanned every Load (slice header)
+	committedSlots         []atomic.Int64  // 24B — Store every Commit; scanned every Load (slice header)
 	capacity               uint32          // 4B  — buffer capacity (power of 2)
-	shift                  uint8           // 1B  — read every Commit and Load
-	_                      [19]byte        // 19B — padding to 64B boundary
+	_                      [20]byte        // 20B — padding to 64B boundary
 
 	// cache line 2 — slow path only
 	consumerBarrier sequenceBarrier // 16B — slow path
@@ -55,7 +56,7 @@ type sharedSequencer struct {
 } // 128B total — fills two 64B cache lines
 
 func newSharedSequencer(capacity uint32, reservedSequence *atomicSequence, waiter WaitStrategy) *sharedSequencer {
-	committedSlots := make([]atomic.Int32, capacity)
+	committedSlots := make([]atomic.Int64, capacity)
 	for i := range committedSlots {
 		committedSlots[i].Store(defaultSequenceValue)
 	}
@@ -63,7 +64,6 @@ func newSharedSequencer(capacity uint32, reservedSequence *atomicSequence, waite
 	return &sharedSequencer{
 		reservedSequence:       reservedSequence,
 		cachedConsumerSequence: newSequence(),
-		shift:                  uint8(bits.TrailingZeros32(capacity)),
 		capacity:               capacity,
 		committedSlots:         committedSlots,
 		waiter:                 waiter,
@@ -133,19 +133,32 @@ func (this *sharedSequencer) hasAvailableCapacity(previousReservedSequence, coun
 }
 
 func (this *sharedSequencer) Commit(lower, upper int64) {
-	for mask := int64(this.capacity) - 1; lower <= upper; lower++ {
-		this.committedSlots[lower&mask].Store(int32(lower >> this.shift)) // see notes above for shift field
+	if lower > upper {
+		return // an empty range would overwrite (and hide) the marker of a batch already committed at lower
 	}
+
+	this.committedSlots[lower&(int64(this.capacity)-1)].Store(upper) // see notes above for committedSlots field
 }
 
 func (this *sharedSequencer) Load(lower int64) int64 {
+	// A batch reserved after this read begins beyond upper, and a batch beginning at or before upper was reserved (in
+	// its entirety) before this read, so jumping by whole batches can never overshoot upper.
 	upper := this.reservedSequence.Load()
 
-	for mask := int64(this.capacity) - 1; lower <= upper; lower++ {
-		if this.committedSlots[lower&mask].Load() != int32(lower>>this.shift) {
-			return lower - 1
+	for mask := int64(this.capacity) - 1; lower <= upper; {
+		// A single-slot batch advances via lower++ behind a (predictable) branch rather than lower = marker+1: that
+		// turns the data dependency upon the loaded marker into a control dependency, so the CPU speculatively issues
+		// the next slot's load without waiting for this one. As a pure data dependency, each load must complete
+		// (often a cross-core transfer) before the next can begin, which made single-slot batches ~6% slower.
+		marker := this.committedSlots[lower&mask].Load()
+		if marker < lower {
+			break // uncommitted: a stale marker from an earlier lap (or the initial -1)
+		} else if marker == lower {
+			lower++
+		} else {
+			lower = marker + 1 // skip to the first sequence of the next batch
 		}
 	}
 
-	return upper
+	return lower - 1
 }
