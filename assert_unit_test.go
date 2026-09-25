@@ -26,6 +26,14 @@ func TestNew_NilHandlersFiltered(t *testing.T) {
 		t.Fatal("expected error when all handlers are nil")
 	}
 }
+func TestNew_TypedNilHandlersFiltered(t *testing.T) {
+	var nilPointer *pointerHandler
+	var nilFunc handlerFunc
+	_, err := New(Options.BufferCapacity(1024), Options.NewHandlerGroup(nilPointer, nilFunc))
+	if err == nil {
+		t.Fatal("expected error when all handlers are typed nils")
+	}
+}
 
 func TestReserve_ZeroSlots(t *testing.T) {
 	d := newTestDisruptor(t, 1)
@@ -110,3 +118,11 @@ func newTestDisruptor(t *testing.T, writerCount uint8) Disruptor {
 	}
 	return d
 }
+
+type pointerHandler struct{ handled int64 }
+
+func (this *pointerHandler) Handle(_, upper int64) { this.handled = upper }
+
+type handlerFunc func(lower, upper int64)
+
+func (this handlerFunc) Handle(lower, upper int64) { this(lower, upper) }

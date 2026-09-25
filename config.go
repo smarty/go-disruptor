@@ -2,6 +2,7 @@ package disruptor
 
 import (
 	"errors"
+	"reflect"
 	"runtime"
 	"time"
 )
@@ -80,7 +81,7 @@ func (singleton) NewHandlerGroup(values ...Handler) option {
 	return func(this *configuration) {
 		filtered := make([]Handler, 0, len(values))
 		for _, value := range values {
-			if value != nil {
+			if !isNilHandler(value) {
 				filtered = append(filtered, value)
 			}
 		}
@@ -88,6 +89,21 @@ func (singleton) NewHandlerGroup(values ...Handler) option {
 		if len(filtered) > 0 {
 			this.HandlerGroups = append(this.HandlerGroups, filtered)
 		}
+	}
+}
+
+// isNilHandler reports whether the Handler is nil, including a typed nil (e.g. a nil *T or nil func stored in the
+// interface) which would otherwise pass a plain `value != nil` check and panic later on the listener goroutine.
+func isNilHandler(value Handler) bool {
+	if value == nil {
+		return true
+	}
+
+	switch reflected := reflect.ValueOf(value); reflected.Kind() {
+	case reflect.Pointer, reflect.Func:
+		return reflected.IsNil()
+	default:
+		return false // e.g. methods on a nil map or nil slice are valid, so those are not treated as nil
 	}
 }
 
