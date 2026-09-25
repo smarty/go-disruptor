@@ -35,6 +35,22 @@ func TestNew_TypedNilHandlersFiltered(t *testing.T) {
 	}
 }
 
+func TestListen_DrainsCommitRacingWithClose(t *testing.T) {
+	// Deterministically forces the interleaving: the listener reads the committed barrier (nothing yet), then the
+	// producer commits sequence 0 and calls Close, and only then does the listener read the running flag.
+	committed := newSequence()
+	handled := int64(defaultSequenceValue)
+	var listener ListenCloser
+	barrier := &racingCommitBarrier{committed: committed, listener: &listener}
+	listener = newListener(newSequence(), barrier, newAtomicBarrier(committed), defaultWaitStrategy{}, recordingHandler{handled: &handled})
+
+	listener.Listen()
+
+	if handled != 0 {
+		t.Fatalf("sequence 0 was committed before Close but never handled; handled=%d", handled)
+	}
+}
+
 func TestReserve_ZeroSlots(t *testing.T) {
 	d := newTestDisruptor(t, 1)
 	if result := d.Reserve(0); result != ErrReservationSize {
@@ -126,3 +142,25 @@ func (this *pointerHandler) Handle(_, upper int64) { this.handled = upper }
 type handlerFunc func(lower, upper int64)
 
 func (this handlerFunc) Handle(lower, upper int64) { this(lower, upper) }
+
+type recordingHandler struct{ handled *int64 }
+
+func (this recordingHandler) Handle(_, upper int64) { *this.handled = upper }
+
+// racingCommitBarrier simulates a producer that commits and then closes the listener immediately after the
+// listener's first read of the committed barrier.
+type racingCommitBarrier struct {
+	committed *atomicSequence
+	listener  *ListenCloser
+	fired     bool
+}
+
+func (this *racingCommitBarrier) Load(_ int64) int64 {
+	value := this.committed.Load()
+	if !this.fired {
+		this.fired = true
+		this.committed.Store(0) // producer: Commit(0, 0)
+		_ = (*this.listener).Close()
+	}
+	return value
+}

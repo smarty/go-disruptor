@@ -73,7 +73,9 @@ func (this *defaultListener) Listen() {
 			idlingCount++
 			gatedCount = 0
 			this.waiter.Idle(idlingCount)
-		} else {
+		} else if upperSequence = this.committedBarrier.Load(lowerSequence); lowerSequence > upperSequence {
+			// Close was observed only *after* the committed barrier was checked above, so any Commit that preceded
+			// Close may have landed in between; re-checking here guarantees those events are drained, not dropped.
 			break
 		}
 	}
