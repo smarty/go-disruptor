@@ -105,11 +105,13 @@ is unreachable for group 0—it will always return the same result as the first 
 
 ### Release/acquire semantics for `committedSlots` via `go:linkname`
 
-`sharedSequencer.committedSlots` is the only Commit→Load ordering edge in the shared producer, but is currently typed as
-`[]atomic.Int32`—every `Store`/`Load` pays sequential-consistency cost. The pairwise Commit→Load relationship only
-requires release/acquire. The `load-acquire` branch (commit `bc78c07`) prototypes this by changing the field to
-`[]uint32` and reaching into the runtime via `go:linkname` to call `internal/runtime/atomic.LoadAcq` / `StoreRel`
-directly:
+`sharedSequencer.committedSlots` is the only Commit→Load ordering edge in the shared producer (as is `committedSequence`
+for the single producer), but is currently typed as `[]atomic.Int64`—every `Store`/`Load` pays sequential-consistency
+cost. (Since the prototype below, the shared sequencer moved from one `atomic.Int32` per slot to one `atomic.Int64`
+marker per batch, so the prototype would need to be redone with 64-bit operations.) The pairwise Commit→Load
+relationship only requires release/acquire. The `load-acquire` branch (commit `bc78c07`) prototypes this by changing the
+field to `[]uint32` and reaching into the runtime via `go:linkname` to call `internal/runtime/atomic.LoadAcq` /
+`StoreRel` directly:
 
 ```go
 //go:linkname loadAcq32 internal/runtime/atomic.LoadAcq
@@ -120,8 +122,11 @@ func storeRel32(ptr *uint32, val uint32)
 ```
 
 Measured ~3-5% throughput improvement on the single-slot Reserve path on Apple M5 (ARM64, weakly-ordered); negligible on
-batched `ReserveMany` paths because the per-slot Commit/Load loop is amortized. On x86 (TSO) the gain would be near
-zero, since plain loads/stores already imply acquire/release semantics there.
+batched `ReserveMany` paths because the per-slot Commit/Load loop is amortized. On x86 (TSO), seq-cst *loads* are
+already plain `MOV`s, but seq-cst *stores* are not: Go compiles `atomic.Int64.Store` to `XCHG`, a full barrier, and
+`perf` on a Zen 2 showed `Commit`'s `XCHG` taking 51-58% of all cycles in the single-writer benchmarks (about 19 cycles
+per event). A release store is a plain `MOV` on x86, so the x86 gain from this item could be the largest remaining one,
+for the single writer's `committedSequence` as well as for `committedSlots`. Measure before assuming it.
 
 Reasons it lives in a branch rather than `master`:
 

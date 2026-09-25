@@ -66,9 +66,13 @@ array) and indexes into it using `sequence & mask`.
 - **`sequencer_shared.go`** — Multi-writer sequencer (128B, two cache lines). Uses atomic Add for `Reserve` (not CAS —
   irrevocable but scales under contention); `TryReserve` is non-blocking (lock-free CAS loop, like Java's `tryNext`): a
   lost CAS is contention, not a full buffer, so it re-checks capacity and retries, returning `ErrCapacityUnavailable`
-  only when capacity is genuinely exhausted. Uses per-slot commit tracking via
-  `committedSlots []atomic.Int32` with round numbers (`sequence >> shift`) to disambiguate laps around the ring buffer.
-  `Load` scans committed slots from lower to upper, stopping at the first uncommitted slot. `cachedConsumerSequence` is
+  only when capacity is genuinely exhausted. Tracks commits with one marker per *batch* in
+  `committedSlots []atomic.Int64`: `Commit(lower, upper)` stores `upper` in the slot of `lower`, and `Load` jumps from
+  marker to marker, stopping at the first slot whose marker is `< lower` (stale from an earlier lap, or the initial -1;
+  int64 sequences never wrap, so a marker can go unrewritten for any number of laps). This relies on every `Load`
+  starting at a batch boundary, which holds because callers only pass `handledSequence+1` (see the struct comment).
+  `Load` advances single-slot batches with `lower++` behind a branch, not `lower = marker+1`, to avoid a serial
+  dependent-load chain (see Performance Findings). `cachedConsumerSequence` is
   `*atomicSequence` (atomic because multiple writers may update it concurrently). Also implements `sequenceBarrier`
   (the `Load` method).
 - **`listener.go`** — Runs a consumer loop (blocks calling goroutine). Has two barriers: `committedBarrier` (how far
@@ -137,6 +141,23 @@ goroutine placement across CCXs varies per run, so only large, replicated multi-
   reading the writers' contended cache line). Mixed: single-consumer 7-10% slower, multi-consumer ~4% faster; an
   earlier unpinned run was 16-35% slower. Likely the consumer reads ahead into slot lines that writers are storing to.
 - **The correctness fixes** (listener drain re-check, alignment) measured no change. `TryReserve` has no benchmark.
+- **Adopted — one commit marker per batch in the shared sequencer** (was one atomic store per slot in `Commit` and
+  one load per slot in `Load`). Multi-producer reserve-16 is 19-25% faster (replicated across three runs); reserve-1
+  is unchanged, and the shared sequencer with one writer is 2.7% faster. The first version stored a 32-bit round
+  number plus length, which is only safe when every slot is rewritten every lap; with markers, interior slots may never
+  be rewritten, so the round wrapped after 2^32 laps (~4 hours at 300M events/s on a 1024-slot ring) and falsely
+  matched. Storing the batch's `upper` sequence fixes it (`TestSharedLoad_RejectsMarkerStaleForManyLaps`).
+- **Dependent-load chains matter.** With `lower = marker+1`, each slot's address depends on the previous load, so the
+  consumer's scan becomes serial cross-core fetches: reserve-1 was 5.6% *slower* than per-slot commits (and 9.1% with a
+  16K ring, which disproved an L2-footprint explanation). Advancing single-slot batches with `lower++` behind a
+  predictable branch (verify there is no `CMOV` in the assembly) restored parallel loads and turned it into a 2.7% win.
+- **Rejected — concrete dispatch** (`New()` returning structs that embed `*defaultSequencer`/`*sharedSequencer`
+  instead of the `Sequencer` interface, removing one indirect call and inlining `Commit` into the wrapper). 8.5% fewer
+  instructions but 7.2% more cycles, so single-producer was 7% slower (replicated). Code alignment was ruled out. The
+  single-writer path is bound by `Commit`'s `XCHG` (51-58% of cycles in `perf`); shortening the work before the
+  barrier cannot help. Untested on Intel.
+- **Seq-cst stores are not free on x86.** A Go `atomic.Int64.Store` compiles to `XCHG` (a full barrier, ~19 cycles on
+  Zen 2) and dominates single-writer throughput. Only seq-cst *loads* are plain `MOV`s on x86.
 
 ### Conventions
 
