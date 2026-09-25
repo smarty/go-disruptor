@@ -108,19 +108,19 @@ func (this *sharedSequencer) TryReserve(count uint32) int64 {
 		return ErrReservationSize
 	}
 
-	// fast path
-	slots := int64(count)
-	previousReservedSequence := this.reservedSequence.Load()
-	if !this.hasAvailableCapacity(previousReservedSequence, slots) {
-		return ErrCapacityUnavailable
-	}
+	// A failed CAS means another writer claimed slots first (i.e. contention), not that the ring buffer is full, so the
+	// capacity is re-evaluated and the claim retried. The loop is lock-free: every failed CAS means some other writer
+	// made progress, and the loop exits with ErrCapacityUnavailable as soon as capacity is genuinely exhausted.
+	for slots := int64(count); ; {
+		previousReservedSequence := this.reservedSequence.Load()
+		if !this.hasAvailableCapacity(previousReservedSequence, slots) {
+			return ErrCapacityUnavailable
+		}
 
-	if !this.reservedSequence.CompareAndSwap(previousReservedSequence, previousReservedSequence+slots) {
-		return ErrCapacityUnavailable
+		if this.reservedSequence.CompareAndSwap(previousReservedSequence, previousReservedSequence+slots) {
+			return previousReservedSequence + slots
+		}
 	}
-
-	// slow path
-	return previousReservedSequence + slots
 }
 func (this *sharedSequencer) hasAvailableCapacity(previousReservedSequence, count int64) bool {
 	var (

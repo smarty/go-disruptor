@@ -1,6 +1,7 @@
 package disruptor
 
 import (
+	"sync"
 	"testing"
 	"unsafe"
 )
@@ -136,6 +137,42 @@ func TestSharedTryReserve_CapacityUnavailable(t *testing.T) {
 	}
 	if result := d.TryReserve(1); result != ErrCapacityUnavailable {
 		t.Fatalf("expected ErrCapacityUnavailable, got %d", result)
+	}
+}
+func TestSharedTryReserve_ContentionIsNotCapacityExhaustion(t *testing.T) {
+	const writers = 8
+	const capacity = 1024
+	d := newTestDisruptor(t, writers)
+
+	// No consumer is running, so the ring buffer holds exactly `capacity` slots; every one of these claims fits and
+	// must succeed even though concurrent writers make individual CAS attempts fail.
+	var start, finished sync.WaitGroup
+	var failures [writers]int
+	start.Add(1)
+	finished.Add(writers)
+	for writer := 0; writer < writers; writer++ {
+		go func() {
+			defer finished.Done()
+			start.Wait()
+			for claim := 0; claim < capacity/writers; claim++ {
+				if sequence := d.TryReserve(1); sequence < 0 {
+					failures[writer]++
+				} else {
+					d.Commit(sequence, sequence)
+				}
+			}
+		}()
+	}
+	start.Done()
+	finished.Wait()
+
+	for writer, count := range failures {
+		if count > 0 {
+			t.Errorf("writer %d: %d TryReserve calls failed despite available capacity", writer, count)
+		}
+	}
+	if result := d.TryReserve(1); result != ErrCapacityUnavailable {
+		t.Fatalf("expected ErrCapacityUnavailable once the ring buffer is full, got %d", result)
 	}
 }
 

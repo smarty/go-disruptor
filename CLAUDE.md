@@ -64,8 +64,9 @@ array) and indexes into it using `sequence & mask`.
   `WaitStrategy.Reserve()` when waiting for consumers to advance. `TryReserve` is non-blocking: single barrier check,
   returns `ErrCapacityUnavailable` if no room.
 - **`sequencer_shared.go`** — Multi-writer sequencer (128B, two cache lines). Uses atomic Add for `Reserve` (not CAS —
-  irrevocable but scales under contention); `TryReserve` is non-blocking with a single capacity check plus a single CAS
-  attempt, returning `ErrCapacityUnavailable` on failure. Uses per-slot commit tracking via
+  irrevocable but scales under contention); `TryReserve` is non-blocking (lock-free CAS loop, like Java's `tryNext`): a
+  lost CAS is contention, not a full buffer, so it re-checks capacity and retries, returning `ErrCapacityUnavailable`
+  only when capacity is genuinely exhausted. Uses per-slot commit tracking via
   `committedSlots []atomic.Int32` with round numbers (`sequence >> shift`) to disambiguate laps around the ring buffer.
   `Load` scans committed slots from lower to upper, stopping at the first uncommitted slot. `cachedConsumerSequence` is
   `*atomicSequence` (atomic because multiple writers may update it concurrently). Also implements `sequenceBarrier`

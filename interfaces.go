@@ -59,7 +59,8 @@ type Sequencer interface {
 	// TryReserve attempts a single non-blocking reservation of the desired number of slots. If the slots are
 	// immediately available, the uppermost sequence is returned. If the ring buffer has insufficient capacity
 	// because consumers have not yet advanced far enough, ErrCapacityUnavailable is returned without waiting.
-	// For the shared Sequencer, this uses a single CAS attempt rather than atomic Add.
+	// For the shared Sequencer, this uses CAS rather than atomic Add; a CAS lost to a concurrent writer is retried
+	// (it signals contention, not a full ring buffer), so ErrCapacityUnavailable always means insufficient capacity.
 	//
 	// Each successful call to TryReserve should *always* be followed by a single call to Commit.
 	TryReserve(slots uint32) (upperSequence int64)
