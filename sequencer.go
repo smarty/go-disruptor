@@ -54,24 +54,20 @@ func (this *defaultSequencer) Reserve(count uint32) int64 {
 		return ErrReservationSize
 	}
 
-	// fast path
-	previousReservedSequence := this.reservedSequence
 	this.reservedSequence += int64(count)
-	minimumSequence := this.reservedSequence - int64(this.capacity)
-	if minimumSequence <= this.cachedConsumerSequence && this.cachedConsumerSequence <= previousReservedSequence {
-		return this.reservedSequence
-	}
-
-	// slow path
-	for spin := int64(0); ; spin++ {
-		this.cachedConsumerSequence = this.consumerBarrier.Load(0)
-		if minimumSequence <= this.cachedConsumerSequence {
-			break
-		}
-		this.waiter.Reserve(spin)
+	if minimumSequence := this.reservedSequence - int64(this.capacity); minimumSequence > this.cachedConsumerSequence {
+		this.waitForConsumers(minimumSequence) // slow path
 	}
 
 	return this.reservedSequence
+}
+func (this *defaultSequencer) waitForConsumers(minimumSequence int64) {
+	for spin := int64(0); ; spin++ {
+		if this.cachedConsumerSequence = this.consumerBarrier.Load(0); minimumSequence <= this.cachedConsumerSequence {
+			return
+		}
+		this.waiter.Reserve(spin)
+	}
 }
 func (this *defaultSequencer) TryReserve(count uint32) int64 {
 	if count == 0 || count > this.capacity {
@@ -79,10 +75,9 @@ func (this *defaultSequencer) TryReserve(count uint32) int64 {
 	}
 
 	// fast path
-	previousReservedSequence := this.reservedSequence
 	this.reservedSequence += int64(count)
 	minimumSequence := this.reservedSequence - int64(this.capacity)
-	if minimumSequence <= this.cachedConsumerSequence && this.cachedConsumerSequence <= previousReservedSequence {
+	if minimumSequence <= this.cachedConsumerSequence {
 		return this.reservedSequence
 	}
 

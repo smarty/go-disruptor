@@ -118,6 +118,26 @@ lock-free code. The codebase uses explicit padding to prevent it:
   with hot fields on the first cache line and slow-path fields on the second. When modifying these structs, preserve
   the size/access annotations and keep fields within their cache line boundaries.
 
+### Performance Findings
+
+Measured 2026-09-25 on a Threadripper 3970X (Zen 2), boost off, benchmarks pinned to reserved cores with all other
+userspace and IRQs moved off them, variants interleaved in shuffled order across 10 rounds and compared with benchstat.
+Single-producer results were stable to ±0-3%; multi-producer (4 writers across two CCXs) is inherently ±10-25% because
+goroutine placement across CCXs varies per run, so only large, replicated multi-producer deltas mean anything.
+
+- **Adopted — `Reserve` fast path shape.** The Java-derived `cached <= previousReservedSequence` check is always true
+  in this port (Java needs it only for `claim()`/rewind, which does not exist here). Removing it *and* moving the spin
+  loop into a separate `waitForConsumers` method made single-producer end-to-end benchmarks 6.3-6.5% faster
+  (replicated). Removing the check alone gave only ~2.5% (the compiler also flipped the branch layout). The isolated
+  `Sequencer/Reserve` micro-benchmark gets ~2.7% *slower* either way; trust the end-to-end benchmarks.
+- **Rejected — 128B padding on amd64** (to defeat the adjacent-line prefetcher, as Java LMAX does on x86). A -9.5%
+  result on one multi-producer benchmark did not replicate in a second run; everything else was neutral on Zen 2.
+  Untested on Intel, where the spatial prefetcher is documented — worth re-running on the i7-12700K.
+- **Rejected — shared `Load` scanning up to `lower+capacity-1` instead of reading `reservedSequence`** (to avoid
+  reading the writers' contended cache line). Mixed: single-consumer 7-10% slower, multi-consumer ~4% faster; an
+  earlier unpinned run was 16-35% slower. Likely the consumer reads ahead into slot lines that writers are storing to.
+- **The correctness fixes** (listener drain re-check, alignment) measured no change. `TryReserve` has no benchmark.
+
 ### Conventions
 
 - Refer to `example/main.go` and the README for current API usage.

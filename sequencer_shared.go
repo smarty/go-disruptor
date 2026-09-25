@@ -75,32 +75,24 @@ func (this *sharedSequencer) Reserve(count uint32) int64 {
 		return ErrReservationSize
 	}
 
-	var (
-		slots                    = int64(count)
-		reservedSequence         = this.reservedSequence.Add(slots) // claims the slot for the caller (not using CAS operation)
-		previousReservedSequence = reservedSequence - slots
-		minimumSequence          = reservedSequence - int64(this.capacity)
-		consumerSequence         = this.cachedConsumerSequence.Load()
-	)
-
-	// fast path
-	if minimumSequence <= consumerSequence && consumerSequence <= previousReservedSequence {
-		return reservedSequence
+	reservedSequence := this.reservedSequence.Add(int64(count)) // claims the slot for the caller (not using CAS operation)
+	if minimumSequence := reservedSequence - int64(this.capacity); minimumSequence > this.cachedConsumerSequence.Load() {
+		this.waitForConsumers(minimumSequence) // slow path
 	}
 
-	// slow path
+	return reservedSequence
+}
+func (this *sharedSequencer) waitForConsumers(minimumSequence int64) {
 	for spin := int64(0); ; spin++ {
-		consumerSequence = this.consumerBarrier.Load(0)
-		if minimumSequence <= consumerSequence {
-			break
+		if consumerSequence := this.consumerBarrier.Load(0); minimumSequence <= consumerSequence {
+			// The cachedConsumerSequence field may be overwritten by multiple writers. It's only useful for helping
+			// prevent execution of the slow path. In a worst-case scenario, the value is behind and the slow path is
+			// traversed.
+			this.cachedConsumerSequence.Store(consumerSequence)
+			return
 		}
 		this.waiter.Reserve(spin)
 	}
-
-	// The cachedConsumerSequence field may be overwritten by multiple writers. It's only useful for helping prevent
-	// execution of the slow path. In a worst-case scenario, the value is behind and the slow path is traversed.
-	this.cachedConsumerSequence.Store(consumerSequence)
-	return reservedSequence
 }
 
 func (this *sharedSequencer) TryReserve(count uint32) int64 {
@@ -130,7 +122,7 @@ func (this *sharedSequencer) hasAvailableCapacity(previousReservedSequence, coun
 	)
 
 	// fast path
-	if minimumSequence <= consumerSequence && consumerSequence <= previousReservedSequence {
+	if minimumSequence <= consumerSequence {
 		return true
 	}
 
