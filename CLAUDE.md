@@ -50,9 +50,11 @@ array) and indexes into it using `sequence & mask`.
   `defaultWaitStrategy` and `defaultDisruptor`.
 - **`sequence.go`** — `atomicSequence`: cache-line-padded `atomic.Int64`. Padding is `[CacheLineBytes - 8]byte` placed
   before the embedded `atomic.Int64` (one-sided padding — the next allocation's leading padding provides the trailing
-  separation). `newSequence()` constructor retries allocation until cache-aligned. `newSequences(count)` allocates a
-  single contiguous backing array (also retried for alignment) and returns a `[]*atomicSequence` view into it for cache
-  locality across multiple sequences. `defaultSequenceValue = -1` is the initial value for all sequences.
+  separation). `newSequences(count)` over-allocates one extra cache line as a single contiguous `[]byte` and starts the
+  sequences at the first aligned offset (deterministic; does not depend on allocator size classes, which do *not*
+  yield aligned addresses for some counts on s390x), returning a `[]*atomicSequence` view into it for cache locality
+  across multiple sequences. `newSequence()` is `newSequences(1)[0]`. `defaultSequenceValue = -1` is the initial value
+  for all sequences.
 - **`cpu_padding_*bit.go`** — Platform-specific `CacheLineBytes` constant selected by build tags:
   - `cpu_padding_32bit.go` — 32B for `arm`, `mips`, `mipsle`, `mips64`, `mips64le`
   - `cpu_padding_64bit.go` — 64B for `386`, `amd64`, `arm64` (non-Darwin), `loong64`, `riscv64`, `wasm`
@@ -108,8 +110,8 @@ lock-free code. The codebase uses explicit padding to prevent it:
   declarations must always reference the constant rather than hard-coding 64.
 - **`atomicSequence`** — The core shared counter. Wraps `atomic.Int64` with one-sided `[CacheLineBytes - 8]byte`
   padding (a single leading pad; the trailing pad is supplied by the next sequence's leading pad in a contiguous
-  layout). `newSequence()`/`newSequences()` both retry allocation until the result is cache-aligned, ensuring the
-  counter sits alone on its own cache line.
+  layout). `newSequences()` over-allocates and offsets to a cache-aligned address, ensuring the counter sits alone on
+  its own cache line.
 - **Struct field layout** — Structs like `defaultSequencer` (64B, one cache line) and `sharedSequencer` (128B, two
   cache lines) annotate each field with its size and access frequency. Fields are ordered by hot-path access pattern,
   with hot fields on the first cache line and slow-path fields on the second. When modifying these structs, preserve

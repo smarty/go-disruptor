@@ -29,13 +29,6 @@ Apple Silicon (128B lines), both structs fit in a single cache line, which means
 the hot fields straddle the boundary. The code is correct everywhere but the performance optimization only works as
 intended on x86.
 
-### `newSequence()` retry loop is unbounded
-
-`sequence.go:15`: The allocation loop retries `new(atomicSequence)` until it gets a cache-line-aligned pointer, with no
-iteration limit. Go's allocator will almost always return aligned pointers for these sizes, but there's no guarantee.
-An allocation failure or pathological allocator behavior would spin forever. A bounded retry with an
-over-allocate-and-align fallback would be more robust.
-
 ### Error sentinels as magic int64 values
 
 `ErrReservationSize = -1` and `ErrCapacityUnavailable = -2` are bare int64 constants, not `error` types. A caller that

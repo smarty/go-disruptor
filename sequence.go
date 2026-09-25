@@ -11,21 +11,19 @@ type atomicSequence struct {
 	atomic.Int64
 }
 
-func newSequence() (this *atomicSequence) {
-	for this = new(atomicSequence); uintptr(unsafe.Pointer(this))%CacheLineBytes != 0; this = new(atomicSequence) {
-		// not cache aligned, try again
-	}
-
-	this.Store(defaultSequenceValue)
-	return this
+func newSequence() *atomicSequence {
+	return newSequences(1)[0]
 }
 
-// newSequences allocates a contiguous, cache-line-aligned slice of *atomicSequence
+// newSequences allocates a contiguous, cache-line-aligned slice of *atomicSequence. Rather than relying upon the Go
+// allocator's size classes to happen to produce an aligned address (which, for example, does not hold for some counts
+// on s390x with 256B cache lines), one extra cache line is over-allocated and the sequences begin at the first aligned
+// offset within it. The backing array contains no pointers (noscan) and Go's GC does not move heap objects, so the
+// alignment is stable for the life of the allocation, which is kept alive by the returned pointers into it.
 func newSequences(count int) []*atomicSequence {
-	var contiguous []atomicSequence // single, contiguous allocation
-	for contiguous = make([]atomicSequence, count); uintptr(unsafe.Pointer(&contiguous[0]))%CacheLineBytes != 0; contiguous = make([]atomicSequence, count) {
-		// not cache aligned, try again
-	}
+	backing := make([]byte, (count+1)*CacheLineBytes) // single, contiguous allocation
+	offset := (CacheLineBytes - uintptr(unsafe.Pointer(&backing[0]))%CacheLineBytes) % CacheLineBytes
+	contiguous := unsafe.Slice((*atomicSequence)(unsafe.Pointer(&backing[offset])), count)
 
 	// guaranteed cache alignment of underlying sequence values which are *contiguous*
 	this := make([]*atomicSequence, count)

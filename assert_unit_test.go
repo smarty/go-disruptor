@@ -1,6 +1,9 @@
 package disruptor
 
-import "testing"
+import (
+	"testing"
+	"unsafe"
+)
 
 func TestNew_ZeroCapacity(t *testing.T) {
 	_, err := New(Options.BufferCapacity(0), Options.NewHandlerGroup(nopHandler{}))
@@ -48,6 +51,19 @@ func TestListen_DrainsCommitRacingWithClose(t *testing.T) {
 
 	if handled != 0 {
 		t.Fatalf("sequence 0 was committed before Close but never handled; handled=%d", handled)
+	}
+}
+
+func TestNewSequences_CacheAligned(t *testing.T) {
+	for count := 1; count <= 256; count++ {
+		for index, sequence := range newSequences(count) {
+			if address := uintptr(unsafe.Pointer(sequence)); address%CacheLineBytes != 0 {
+				t.Fatalf("count=%d index=%d: address %#x is not aligned to %d bytes", count, index, address, CacheLineBytes)
+			}
+			if sequence.Load() != defaultSequenceValue {
+				t.Fatalf("count=%d index=%d: expected initial value %d, got %d", count, index, defaultSequenceValue, sequence.Load())
+			}
+		}
 	}
 }
 
