@@ -144,7 +144,9 @@ func BenchmarkSequencer(b *testing.B) {
 	b.Run("SP4MC", func(b *testing.B) { benchmarkDisruptor(b, reserve4, 1, nopHandler{}, nopHandler{}) })
 }
 func BenchmarkSharedSequencer(b *testing.B) {
-	b.Run("SP SC/R1", func(b *testing.B) { benchmarkDisruptor(b, reserve1, 1, nopHandler{}) })
+	b.Run("SP SC/R1", func(b *testing.B) { // one writer goroutine, but WriterCount(2) forces the shared sequencer
+		benchmarkDisruptorWith(b, reserve1, 1, []Handler{nopHandler{}}, Options.WriterCount(2))
+	})
 	b.Run("MP SC/R1", func(b *testing.B) { benchmarkDisruptor(b, reserve1, 4, nopHandler{}) })
 	b.Run("MP SC/R4", func(b *testing.B) { benchmarkDisruptor(b, reserve4, 4, nopHandler{}) })
 	b.Run("MP MC/R1", func(b *testing.B) { benchmarkDisruptor(b, reserve1, 4, nopHandler{}, nopHandler{}) })
