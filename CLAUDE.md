@@ -136,7 +136,13 @@ goroutine placement across CCXs varies per run, so only large, replicated multi-
   `Sequencer/Reserve` micro-benchmark gets ~2.7% *slower* either way; trust the end-to-end benchmarks.
 - **Rejected — 128B padding on amd64** (to defeat the adjacent-line prefetcher, as Java LMAX does on x86). A -9.5%
   result on one multi-producer benchmark did not replicate in a second run; everything else was neutral on Zen 2.
-  Untested on Intel, where the spatial prefetcher is documented — worth re-running on the i7-12700K.
+  Also rejected on Intel (i7-12700K, 2026-09-26, one thread per P-core, turbo off, P-cores reserved, 10 shuffled
+  rounds): no row improved, and `SP4MC` was *slower* in two independent runs (+3.0% unreserved, +7.8% reserved;
+  geomean +1.5%). Mostly this is by construction: `newSequence()` makes a 128B `[]byte`, which Go's 128B size class
+  places 128B-aligned, so every single sequence already owns its whole 128B pair at 64B padding. Only
+  `newSequences(n >= 2)` (the handler sequences) can share a pair, and only about half the time (a 192B allocation
+  alternates between 0 and 64 mod 128). Even then, the spatial prefetcher runs only on L2 fills, and a consumer's own
+  line rarely misses because the producer reads it only on the full-buffer slow path.
 - **Rejected — shared `Load` scanning up to `lower+capacity-1` instead of reading `reservedSequence`** (to avoid
   reading the writers' contended cache line). Mixed: single-consumer 7-10% slower, multi-consumer ~4% faster; an
   earlier unpinned run was 16-35% slower. Likely the consumer reads ahead into slot lines that writers are storing to.
