@@ -15,15 +15,16 @@ go run ./example    # run the example
 
 Benchmarks live in `assert_benchmark_test.go`. Unit tests live in `assert_unit_test.go`. Long-running integration tests
 live in `assert_integration_test.go` and are guarded by `testing.Short()` — `make test` skips them, `make test.long`
-runs them. Both run every test twice, with and without `-race`, because non-race amd64 builds use the assembly release
+runs them. Both run every test twice, with and without `-race`, because non-race amd64 builds use the plain release
 store (see `store_release_*`) that race builds never compile.
 
 `bench/` holds the tooling behind the Performance Findings: `suite` (builds and runs the standard reserved suite),
-`compare` (a git revision against the working tree, reserved), `reserve` (reserves cores and disables turbo, as root),
-`interleave` (shuffled rounds of prebuilt test binaries, then `benchstat`), `msr-prefetch` (Intel prefetcher controls,
-with the measured Golden Cove bit map), and `bench/prefetch` (the `PairChase` positive control for prefetcher
-experiments). `bench/README.md` documents the method, including `perf` event choices and why attribution must use
-precise (`:pp`) sampling. Performance claims should come from that method, with `environment.txt` kept alongside.
+`compare` (a git revision against the working tree, reserved), `revisions` (several git revisions against each other,
+reserved), `reserve` (reserves cores and disables turbo, as root), `interleave` (shuffled rounds of prebuilt test
+binaries, then `benchstat`), `msr-prefetch` (Intel prefetcher controls, with the measured Golden Cove bit map), and
+`bench/prefetch` (the `PairChase` positive control for prefetcher experiments). `bench/README.md` documents the method,
+including `perf` event choices and why attribution must use precise (`:pp`) sampling. Performance claims should come
+from that method, with `environment.txt` kept alongside.
 
 ## Architecture
 
@@ -72,16 +73,21 @@ array) and indexes into it using `sequence & mask`.
   - `cpu_padding_64bit.go` — 64B for `386`, `amd64`, `arm64` (non-Darwin), `loong64`, `riscv64`, `wasm`
   - `cpu_padding_128bit.go` — 128B for `arm64` (Darwin), `ppc64`, `ppc64le`
   - `cpu_padding_256bit.go` — 256B for `s390x`
-- **`store_release_amd64.s`/`store_release_amd64.go`/`store_release_atomic.go`** — `storeRelease(*atomic.Int64,
-  int64)`, the commit store for both sequencers. On amd64 without `-race` it is a one-instruction assembly `MOVQ` (a
-  release store under TSO, where `atomic.Int64.Store` is an `XCHG`); everywhere else, including every `-race` build, it
-  is `atomic.Int64.Store`. The race detector sees only instrumented `sync/atomic` calls, so the stub must stay behind
-  `!race` (forcing it into a race build produces thousands of false data-race reports in `TestEndToEnd`). Never
-  replace it with a plain Go store: PGO can inline `Commit` and the compiler may then move ring-buffer writes past it.
+- **`store_release_amd64.go`/`store_release_atomic.go`** — `storeRelease(*atomic.Int64, int64)`, the single
+  sequencer's commit store. On amd64 without `-race` it is a plain Go store through `unsafe.Pointer` (a `MOVQ`, which
+  is a release store under TSO, where `atomic.Int64.Store` is an `XCHG`); everywhere else, including every `-race`
+  build, it is `atomic.Int64.Store`. The race detector sees only instrumented `sync/atomic` calls, so the plain store
+  must stay behind `!race` (a race build would report it as a data race). It inlines into `defaultSequencer.Commit`,
+  which is `//go:noinline`: that call boundary is the only thing keeping the compiler from moving the caller's
+  ring-buffer writes past the store (PGO would otherwise inline a hot `Commit`, even after devirtualizing it). Never
+  remove the `//go:noinline`, and never call `storeRelease` from a function that can be inlined. It replaced a
+  one-instruction assembly stub whose ABI0 call cost more than the `XCHG` on Zen 2 (see Performance Findings). The
+  shared sequencer does not use it.
 - **`sequencer.go`** — Single-writer sequencer (64B, one cache line). Commits with `storeRelease`. Spins with
   `WaitStrategy.Reserve()` when waiting for consumers to advance. `TryReserve` is non-blocking: single barrier check,
   returns `ErrCapacityUnavailable` if no room.
-- **`sequencer_shared.go`** — Multi-writer sequencer (128B, two cache lines). Uses atomic Add for `Reserve` (not CAS —
+- **`sequencer_shared.go`** — Multi-writer sequencer (128B, two cache lines). Commits with a sequentially consistent
+  `atomic.Int64.Store` (`XCHG`), not `storeRelease` (see Performance Findings). Uses atomic Add for `Reserve` (not CAS —
   irrevocable but scales under contention); `TryReserve` is non-blocking (lock-free CAS loop, like Java's `tryNext`): a
   lost CAS is contention, not a full buffer, so it re-checks capacity and retries, returning `ErrCapacityUnavailable`
   only when capacity is genuinely exhausted. Tracks commits with one marker per *batch* in

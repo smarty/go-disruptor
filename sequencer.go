@@ -90,6 +90,11 @@ func (this *defaultSequencer) TryReserve(count uint32) int64 {
 
 	return this.reservedSequence
 }
+
+// Commit must never be inlined: its release store is a plain store on amd64, and only the call boundary keeps the
+// compiler from moving the caller's ring-buffer writes past it (see storeRelease).
+//
+//go:noinline
 func (this *defaultSequencer) Commit(_, upper int64) {
 	storeRelease(&this.committedSequence.Int64, upper)
 }

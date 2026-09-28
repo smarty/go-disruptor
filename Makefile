@@ -1,7 +1,7 @@
 #!/usr/bin/make -f
 
-# Each target runs twice: with -race, and without it, because non-race amd64 builds replace the sync/atomic commit
-# store with an assembly release store (store_release_amd64.s) that race builds never compile.
+# Each target runs twice: with -race, and without it, because non-race amd64 builds replace the single sequencer's
+# sync/atomic commit store with a plain release store (store_release_amd64.go) that race builds never compile.
 test:
 	go test -timeout=1s -short -race -covermode=atomic ./...
 	go test -timeout=1s -short -count=1 ./...

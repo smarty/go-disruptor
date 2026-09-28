@@ -5,7 +5,7 @@ set -euo pipefail
 # the repository; the reserved run calls sudo once.
 #
 # Usage:
-#   bench/compare [--base REF] [--rounds N] [--output DIRECTORY]
+#   bench/compare [--base REF] [--rounds N] [--output DIRECTORY] [CPU options]
 #
 # The base is built from a temporary, detached worktree of REF (removed on exit), and the candidate from the working
 # tree as it is, including uncommitted changes. Both run the core benchmark sets, interleaved in shuffled order, and
@@ -15,23 +15,28 @@ set -euo pipefail
 #   --base REF          revision to compare against (default HEAD)
 #   --rounds N          interleaved rounds (default 10; ~75 seconds each)
 #   --output DIRECTORY  results directory (default /tmp/go-disruptor-bench/<UTC timestamp>-compare)
+#   --cpus CPUS                   CPUs to reserve: both threads of every benchmark core
+#   --housekeeping CPUS           CPUs for everything else
+#   --single-producer-cpus CPUS   one thread per core, for GOMAXPROCS=4 sets
+#   --multi-producer-cpus CPUS    one thread per core, for GOMAXPROCS=8 sets
 #
-# The CPU layout is the i7-12700K's (see bench/README.md, "Choosing CPUs"); other CPUs need these values changed.
+# The CPU options default to a known layout for the i7-12700K (P-cores only) and the Threadripper 3970X (CCXs 0-1 and
+# their SMT siblings; single producer on one CCX, multi-producer across two); any other CPU must pass all four. See
+# bench/README.md, "Choosing CPUs".
 
-readonly _default_cpu_model="12th Gen Intel(R) Core(TM) i7-12700K"
-readonly _cpus="0-15"
-readonly _housekeeping="16-19"
-readonly _single_producer_cpus="0,2,4,6"
-readonly _multi_producer_cpus="0,2,4,6,8,10,12,14"
 readonly _repository="$(cd "$(dirname "${0}")/.." && pwd)"
 _base="HEAD"
 _rounds=10
 _output=""
 _worktree=""
+_cpus=""
+_housekeeping=""
+_single_producer_cpus=""
+_multi_producer_cpus=""
 
 _main() {
 	_parse_arguments "$@"
-	_assert_cpu_model
+	_apply_cpu_layout
 	test -n "${_output}" || _output="/tmp/go-disruptor-bench/$(date -u '+%Y-%m-%d-%H%M%S')-compare"
 	mkdir -p "${_output}/bin"
 	trap _remove_worktree EXIT
@@ -84,11 +89,28 @@ _find_benchstat() {
 	echo "${_path}"
 }
 
-_assert_cpu_model() {
+_apply_cpu_layout() {
+	test -n "${_cpus}" && test -n "${_housekeeping}" && test -n "${_single_producer_cpus}" &&
+		test -n "${_multi_producer_cpus}" && return 0
+
 	local _model
 	_model="$(lscpu | sed -n 's/^Model name: *//p')"
-	test "${_model}" = "${_default_cpu_model}" ||
-		_fail "The CPU layout is for [${_default_cpu_model}], not [${_model}]; edit the CPU values at the top."
+	case "${_model}" in
+	"AMD Ryzen Threadripper 3970X 32-Core Processor")
+		_apply_layout "0-7,32-39" "8-31,40-63" "0,1,2,3" "0,1,2,3,4,5,6,7" ;;
+	"12th Gen Intel(R) Core(TM) i7-12700K")
+		_apply_layout "0-15" "16-19" "0,2,4,6" "0,2,4,6,8,10,12,14" ;;
+	*)
+		_fail "No known CPU layout for [${_model}]; pass every CPU option." ;;
+	esac
+}
+
+# Fills in only the CPU options that were not passed.
+_apply_layout() {
+	_cpus="${_cpus:-${1}}"
+	_housekeeping="${_housekeeping:-${2}}"
+	_single_producer_cpus="${_single_producer_cpus:-${3}}"
+	_multi_producer_cpus="${_multi_producer_cpus:-${4}}"
 }
 
 _parse_arguments() {
@@ -97,6 +119,10 @@ _parse_arguments() {
 		--base) _base="${2}"; shift 2 ;;
 		--rounds) _rounds="${2}"; shift 2 ;;
 		--output) _output="${2}"; shift 2 ;;
+		--cpus) _cpus="${2}"; shift 2 ;;
+		--housekeeping) _housekeeping="${2}"; shift 2 ;;
+		--single-producer-cpus) _single_producer_cpus="${2}"; shift 2 ;;
+		--multi-producer-cpus) _multi_producer_cpus="${2}"; shift 2 ;;
 		*) _fail "Unknown argument [${1}]." ;;
 		esac
 	done

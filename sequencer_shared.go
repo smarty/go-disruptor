@@ -137,7 +137,9 @@ func (this *sharedSequencer) Commit(lower, upper int64) {
 		return // an empty range would overwrite (and hide) the marker of a batch already committed at lower
 	}
 
-	storeRelease(&this.committedSlots[lower&(int64(this.capacity)-1)], upper) // see notes above for committedSlots field
+	// Sequentially consistent (XCHG on amd64), not storeRelease: on the Threadripper 3970X a release store here made
+	// every multi-producer row 13-28% slower, while on the i7-12700K it made them only 2-5% faster.
+	this.committedSlots[lower&(int64(this.capacity)-1)].Store(upper) // see notes above for committedSlots field
 }
 
 func (this *sharedSequencer) Load(lower int64) int64 {
