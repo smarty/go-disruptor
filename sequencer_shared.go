@@ -143,34 +143,22 @@ func (this *sharedSequencer) Commit(lower, upper int64) {
 }
 
 func (this *sharedSequencer) Load(lower int64) int64 {
-	// Nothing is available when the first slot's marker is stale, whatever has been reserved, so an empty poll returns
-	// without reading reservedSequence: that line is written by every Reserve, and a consumer polling it takes it away
-	// from the writers. A current marker means its batch was reserved before the read below, so upper covers it.
-	mask := int64(this.capacity) - 1
-	marker := this.committedSlots[lower&mask].Load()
-	if marker < lower {
-		return lower - 1 // uncommitted: a stale marker from an earlier lap (or the initial -1)
-	}
-
 	// A batch reserved after this read begins beyond upper, and a batch beginning at or before upper was reserved (in
 	// its entirety) before this read, so jumping by whole batches can never overshoot upper.
 	upper := this.reservedSequence.Load()
 
-	for {
+	for mask := int64(this.capacity) - 1; lower <= upper; {
 		// A single-slot batch advances via lower++ behind a (predictable) branch rather than lower = marker+1: that
 		// turns the data dependency upon the loaded marker into a control dependency, so the CPU speculatively issues
 		// the next slot's load without waiting for this one. As a pure data dependency, each load must complete
 		// (often a cross-core transfer) before the next can begin, which made single-slot batches ~6% slower.
-		if marker == lower {
+		marker := this.committedSlots[lower&mask].Load()
+		if marker < lower {
+			break // uncommitted: a stale marker from an earlier lap (or the initial -1)
+		} else if marker == lower {
 			lower++
 		} else {
 			lower = marker + 1 // skip to the first sequence of the next batch
-		}
-		if lower > upper {
-			break
-		}
-		if marker = this.committedSlots[lower&mask].Load(); marker < lower {
-			break // uncommitted: a stale marker from an earlier lap (or the initial -1)
 		}
 	}
 
