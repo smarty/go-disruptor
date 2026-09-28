@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Builds the test binaries and runs the reserved benchmark suite. Run as yourself, from anywhere in the repository;
+# each reserved step calls sudo (expect a prompt or authenticator touch per step).
+#
+# Usage:
+#   bench/suite [validate|baseline|prefetch|all]...     (default: all, i.e. validate, baseline, then prefetch)
+#
+# Steps:
+#   validate   one round: prefetchers on vs off (MSR 0x1a4 = 0x23) with the PairChase control, asserting that the
+#              switch took effect (PairChase at least 1.3x slower off) before any long run starts. ~1 minute.
+#   baseline   10 rounds of the capacity sweep and ring-buffer benchmarks, prefetchers untouched. ~5 minutes.
+#   prefetch   10 rounds of the same benchmarks, prefetchers on vs off, with the PairChase control. ~10 minutes.
+#
+# Options (defaults are the i7-12700K layout; any other CPU must pass all of them):
+#   --cpus CPUS                   CPUs to reserve: both threads of every benchmark core (default 0-15)
+#   --housekeeping CPUS           CPUs for everything else (default 16-19)
+#   --single-producer-cpus CPUS   one thread per core, for GOMAXPROCS=4 sets (default 0,2,4,6)
+#   --multi-producer-cpus CPUS    one thread per core, for GOMAXPROCS=8 sets (default 0,2,4,6,8,10,12,14)
+#   --control-cpu CPU             CPU for the PairChase control (default 2)
+#   --output DIRECTORY            results root (default /tmp/go-disruptor-bench/<UTC timestamp>)
+#
+# Each step writes <output>/<step>/{environment.txt,<variant>.txt,benchstat.txt}.
+
+readonly _default_cpu_model="12th Gen Intel(R) Core(TM) i7-12700K"
+readonly _repository="$(cd "$(dirname "${0}")/.." && pwd)"
+_cpus=""
+_housekeeping=""
+_single_producer_cpus=""
+_multi_producer_cpus=""
+_control_cpu=""
+_output=""
+_benchstat=""
+_steps=()
+_benchmark_sets=()
+
+_main() {
+	_parse_arguments "$@"
+	_apply_defaults
+	_find_benchstat
+	_build
+	local _step
+	for _step in "${_steps[@]}"; do
+		"_run_${_step}"
+	done
+	_log_info "All results are under [${_output}]."
+}
+
+_run_validate() {
+	local _directory="${_output}/validate"
+	_log_info "Validating reservation and prefetcher switching..."
+	_reserved_interleave --rounds 1 --output "${_directory}" --mask-cpus "${_cpus}" \
+		--set "${_control_cpu}:1:PairChase/PairChase:${_output}/bin/control.test" \
+		--set "${_single_producer_cpus}:4:^BenchmarkSequencer\$/^Commit\$" \
+		on="${_output}/bin/base.test" off="${_output}/bin/base.test@0x23"
+	_assert_prefetch_switch "${_directory}"
+	grep -q '^msr 0x1a4:' "${_directory}/environment.txt" || _fail "environment.txt did not record the MSR values."
+	test -O "${_directory}/on.txt" || _fail "Results in [${_directory}] are not owned by [$(id -un)]."
+	_log_info "Validation passed."
+}
+
+_run_baseline() {
+	_log_info "Running the baseline..."
+	_reserved_interleave --rounds 10 --output "${_output}/baseline" "${_benchmark_sets[@]}" \
+		base="${_output}/bin/base.test"
+}
+
+_run_prefetch() {
+	_log_info "Running prefetchers on vs off..."
+	_reserved_interleave --rounds 10 --output "${_output}/prefetch" --mask-cpus "${_cpus}" \
+		--set "${_control_cpu}:1:PairChase/PairChase:${_output}/bin/control.test" "${_benchmark_sets[@]}" \
+		on="${_output}/bin/base.test" off="${_output}/bin/base.test@0x23"
+	_assert_prefetch_switch "${_output}/prefetch"
+}
+
+_reserved_interleave() {
+	sudo "${_repository}/bench/reserve" --cpus "${_cpus}" --housekeeping "${_housekeeping}" -- \
+		"${_repository}/bench/interleave" --benchstat "${_benchstat}" "$@"
+}
+
+# Fails unless PairChase averaged at least 1.3x slower with the prefetchers off (~1.6x on the i7-12700K).
+_assert_prefetch_switch() {
+	local _directory="${1}" _on _off
+	_on="$(_mean_nanoseconds "${_directory}/on.txt" PairChase/PairChase)"
+	_off="$(_mean_nanoseconds "${_directory}/off.txt" PairChase/PairChase)"
+	_log_info "PairChase: [${_on}] ns with prefetchers on, [${_off}] ns off."
+	awk -v on="${_on}" -v off="${_off}" 'BEGIN { exit !(on > 0 && off / on >= 1.3) }' ||
+		_fail "PairChase did not slow down with the prefetchers off; the switch did not take, so results are void."
+}
+
+_mean_nanoseconds() {
+	local _file="${1}" _benchmark="${2}"
+	awk -v name="${_benchmark}" '
+		$1 ~ name { for (i = 2; i <= NF; i++) if ($i == "ns/op") { sum += $(i - 1); count++ } }
+		END { printf "%.1f", count ? sum / count : 0 }' "${_file}"
+}
+
+_build() {
+	mkdir -p "${_output}/bin"
+	_log_info "Building test binaries into [${_output}/bin]..."
+	(cd "${_repository}" && go test -c -o "${_output}/bin/base.test" . &&
+		go test -c -o "${_output}/bin/control.test" ./bench/prefetch)
+	_benchmark_sets=(
+		--set "${_single_producer_cpus}:4:(SharedSequencerCapacity|RingBuffer)/SP"
+		--set "${_multi_producer_cpus}:8:(SharedSequencerCapacity|RingBuffer)/MP"
+	)
+}
+
+_find_benchstat() {
+	_benchstat="$(command -v benchstat || true)"
+	test -n "${_benchstat}" || _benchstat="$(go env GOPATH)/bin/benchstat"
+	test -x "${_benchstat}" ||
+		_fail "benchstat not found; install it with: go install golang.org/x/perf/cmd/benchstat@latest"
+}
+
+_parse_arguments() {
+	while test "$#" -gt 0; do
+		case "${1}" in
+		--cpus) _cpus="${2}"; shift 2 ;;
+		--housekeeping) _housekeeping="${2}"; shift 2 ;;
+		--single-producer-cpus) _single_producer_cpus="${2}"; shift 2 ;;
+		--multi-producer-cpus) _multi_producer_cpus="${2}"; shift 2 ;;
+		--control-cpu) _control_cpu="${2}"; shift 2 ;;
+		--output) _output="${2}"; shift 2 ;;
+		validate | baseline | prefetch) _steps+=("${1}"); shift ;;
+		all) _steps+=(validate baseline prefetch); shift ;;
+		*) _fail "Unknown argument [${1}]." ;;
+		esac
+	done
+	test "${#_steps[@]}" -gt 0 || _steps=(validate baseline prefetch)
+}
+
+_apply_defaults() {
+	local _model
+	_model="$(lscpu | sed -n 's/^Model name: *//p')"
+	test -z "${_output}" && _output="/tmp/go-disruptor-bench/$(date -u '+%Y-%m-%d-%H%M%S')"
+	test -n "${_cpus}" && test -n "${_housekeeping}" && test -n "${_single_producer_cpus}" &&
+		test -n "${_multi_producer_cpus}" && test -n "${_control_cpu}" && return 0
+	test "${_model}" = "${_default_cpu_model}" ||
+		_fail "The default CPU layout is for [${_default_cpu_model}], not [${_model}]; pass every CPU option."
+	_cpus="${_cpus:-0-15}"
+	_housekeeping="${_housekeeping:-16-19}"
+	_single_producer_cpus="${_single_producer_cpus:-0,2,4,6}"
+	_multi_producer_cpus="${_multi_producer_cpus:-0,2,4,6,8,10,12,14}"
+	_control_cpu="${_control_cpu:-2}"
+}
+
+_fail() { _log_error "${1}"; exit 1; }
+
+_log_info()  { _log "[INFO] ${1}"; }
+_log_error() { _log "[ERROR] ${1}"; }
+_log()       { echo "$(date -u '+%Y-%m-%d %H:%M:%SZ') ${1}" >&2; }
+
+_main "$@"

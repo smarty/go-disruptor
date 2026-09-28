@@ -1,9 +1,11 @@
 package disruptor
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // Key:
@@ -152,6 +154,61 @@ func BenchmarkSharedSequencer(b *testing.B) {
 	b.Run("MP MC/R1", func(b *testing.B) { benchmarkDisruptor(b, reserve1, 4, nopHandler{}, nopHandler{}) })
 	b.Run("MP MC/R4", func(b *testing.B) { benchmarkDisruptor(b, reserve4, 4, nopHandler{}, nopHandler{}) })
 }
+
+// BenchmarkSharedSequencerCapacity sweeps the ring capacity, and with it the footprint of committedSlots (8B per slot:
+// 8KB at 1K slots, 512KB at the default 64K, 8MB at 1M), relative to the core's private L2.
+func BenchmarkSharedSequencerCapacity(b *testing.B) {
+	for _, capacity := range []uint32{1 << 10, 1 << 14, 1 << 16, 1 << 18, 1 << 20} {
+		name := fmt.Sprintf("%dK", capacity>>10)
+		b.Run("SP SC/R1/"+name, func(b *testing.B) {
+			benchmarkDisruptorWith(b, reserve1, 1, []Handler{nopHandler{}}, Options.WriterCount(2), Options.BufferCapacity(capacity))
+		})
+		b.Run("MP SC/R1/"+name, func(b *testing.B) {
+			benchmarkDisruptorWith(b, reserve1, 4, []Handler{nopHandler{}}, Options.WriterCount(4), Options.BufferCapacity(capacity))
+		})
+	}
+}
+
+// BenchmarkRingBuffer adds the application's side of the traffic that the other benchmarks omit: writers store into a
+// ring buffer of 64B entries (4MB at 64K slots) before committing, and the handler reads every entry it is given.
+func BenchmarkRingBuffer(b *testing.B) {
+	b.Run("SP SC/R1", func(b *testing.B) { benchmarkRingBuffer(b, reserve1, 1) })
+	b.Run("SP SC/R4", func(b *testing.B) { benchmarkRingBuffer(b, reserve4, 1) })
+	b.Run("MP SC/R1", func(b *testing.B) { benchmarkRingBuffer(b, reserve1, 4) })
+	b.Run("MP SC/R4", func(b *testing.B) { benchmarkRingBuffer(b, reserve4, 4) })
+}
+func benchmarkRingBuffer(b *testing.B, count uint32, writerCount uint8) {
+	iterations := int64(b.N)
+	offset := int64(count) - 1
+
+	entries := newBenchmarkEntries()
+	handler := &ringBufferHandler{entries: entries}
+	disruptor, _ := New(Options.BufferCapacity(ringBufferSize), Options.WriterCount(writerCount), Options.NewHandlerGroup(handler))
+	defer disruptor.Listen()
+
+	go func() {
+		var waiter sync.WaitGroup
+		waiter.Add(int(writerCount))
+		defer func() { waiter.Wait(); _ = disruptor.Close() }()
+		time.Sleep(time.Millisecond * 100) // let the Listen goroutine have time to start
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for i := uint8(0); i < writerCount; i++ {
+			go func() {
+				defer waiter.Done()
+				for sequence := int64(defaultSequenceValue); sequence < iterations; {
+					sequence = disruptor.Reserve(count)
+					for lower := sequence - offset; lower <= sequence; lower++ {
+						entries[lower&ringBufferMask].Sequence = lower
+					}
+					disruptor.Commit(sequence-offset, sequence)
+				}
+			}()
+		}
+	}()
+}
+
 func benchmarkDisruptor(b *testing.B, count uint32, writerCount uint8, consumers ...Handler) {
 	benchmarkDisruptorWith(b, count, int(writerCount), consumers, Options.WriterCount(writerCount))
 }
@@ -188,8 +245,34 @@ type nopHandler struct{}
 
 func (this nopHandler) Handle(int64, int64) {}
 
+type ringBufferHandler struct {
+	entries  *[ringBufferSize]benchmarkEntry
+	checksum int64
+}
+
+func (this *ringBufferHandler) Handle(lower, upper int64) {
+	for sequence := lower; sequence <= upper; sequence++ {
+		this.checksum += this.entries[sequence&ringBufferMask].Sequence
+	}
+}
+
+type benchmarkEntry struct {
+	Sequence int64    // 8B
+	_        [7]int64 // 56B padding to 64B cache line
+}
+
+// newBenchmarkEntries returns a cache-line-aligned ring buffer. A package-level array would be placed wherever the
+// linker chose (one build put it 32B past a line boundary, so every entry straddled two lines), which can differ
+// between the variant binaries being compared.
+func newBenchmarkEntries() *[ringBufferSize]benchmarkEntry {
+	backing := make([]byte, (ringBufferSize+1)*unsafe.Sizeof(benchmarkEntry{}))
+	offset := (CacheLineBytes - uintptr(unsafe.Pointer(&backing[0]))%CacheLineBytes) % CacheLineBytes
+	return (*[ringBufferSize]benchmarkEntry)(unsafe.Pointer(&backing[offset]))
+}
+
 const (
 	ringBufferSize = 1 << 16 // 64K
+	ringBufferMask = ringBufferSize - 1
 	reserve1       = 1
 	reserve4       = 16
 )

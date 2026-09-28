@@ -17,6 +17,13 @@ Benchmarks live in `assert_benchmark_test.go`. Unit tests live in `assert_unit_t
 live in `assert_integration_test.go` and are guarded by `testing.Short()` — `make test` skips them, `make test.long`
 runs them. The test command runs with race detection enabled.
 
+`bench/` holds the tooling behind the Performance Findings: `suite` (builds and runs the standard reserved suite),
+`reserve` (reserves cores and disables turbo, as root), `interleave` (shuffled rounds of prebuilt test binaries, then
+`benchstat`), `msr-prefetch` (Intel prefetcher controls, with the measured Golden Cove bit map), and `bench/prefetch`
+(the `PairChase` positive control for prefetcher experiments). `bench/README.md` documents the method, including `perf`
+event choices and why attribution must use precise (`:pp`) sampling. Performance claims should come from that method,
+with `environment.txt` kept alongside.
+
 ## Architecture
 
 This is a Go port of the [LMAX Disruptor](https://github.com/LMAX-Exchange/disruptor) — a lock-free, high-performance

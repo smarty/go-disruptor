@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Reserves CPUs for benchmarking, runs a command confined to them, and restores the machine on exit (including Ctrl-C).
+#
+# Usage (as root, via sudo):
+#   sudo bench/reserve --cpus 0-15 --housekeeping 16-19 -- bench/interleave ...
+#
+# While the command runs:
+#   - system.slice, init.scope, and user.slice are confined to the housekeeping CPUs, and so are the threads of the
+#     per-user managers (user@UID.service), which have no cpuset delegated and are not reached by AllowedCPUs=.
+#   - turbo/boost is disabled (intel_pstate no_turbo, or cpufreq boost on AMD).
+#   - the command runs as root in bench.slice, confined to --cpus. bench/interleave drops back to ${SUDO_USER} for the
+#     benchmarks themselves; root is kept only so that it can switch prefetcher masks between runs.
+# The machine state (CPU model, kernel, turbo, and prefetcher MSR values where readable) is logged before the command.
+#
+# Choosing CPUs: never let a benchmark land on a hybrid CPU's E-cores. Read the layout from `lscpu -e=CPU,CORE,MAXMHZ`:
+# P-core threads report the higher MAXMHZ, and SMT siblings share a CORE value. Reserve both threads of each benchmark
+# core (so siblings stay idle), and pin the benchmarks themselves to one thread per core.
+
+readonly _units=(system.slice init.scope user.slice)
+readonly _intel_turbo="/sys/devices/system/cpu/intel_pstate/no_turbo"
+readonly _amd_boost="/sys/devices/system/cpu/cpufreq/boost"
+_bench_cpus=""
+_housekeeping_cpus=""
+_all_cpus=""
+
+_main() {
+	_parse_arguments "$@"
+	shift "$(_count_options "$@")"
+	test "$(id -u)" -eq 0 || _fail "Must run as root (via sudo)."
+	test -n "${SUDO_USER:-}" || _fail "Must run via sudo so that benchmarks can drop back to the invoking user."
+	_all_cpus="$(cat /sys/devices/system/cpu/online)"
+
+	trap _restore EXIT
+	_reserve
+	_log_machine_state
+	_log_info "Running [$*] on CPUs [${_bench_cpus}]..."
+	systemd-run --quiet --slice=bench.slice -p AllowedCPUs="${_bench_cpus}" --wait --pipe --collect \
+		--working-directory="${PWD}" -E SUDO_USER="${SUDO_USER}" -E PATH="${PATH}" -E HOME="${HOME}" -- "$@"
+}
+
+_parse_arguments() {
+	while test "$#" -gt 0; do
+		case "${1}" in
+		--cpus) _bench_cpus="${2}"; shift 2 ;;
+		--housekeeping) _housekeeping_cpus="${2}"; shift 2 ;;
+		--) shift; break ;;
+		*) _fail "Unknown argument [${1}]." ;;
+		esac
+	done
+	test -n "${_bench_cpus}" || _fail "Missing --cpus."
+	test -n "${_housekeeping_cpus}" || _fail "Missing --housekeeping."
+	test "$#" -gt 0 || _fail "Missing the command to run after [--]."
+}
+
+# Prints how many leading arguments (up to and including "--") belong to this script.
+_count_options() {
+	local _count=0
+	while test "$#" -gt 0; do
+		_count=$((_count + 1))
+		test "${1}" = "--" && break
+		shift
+	done
+	echo "${_count}"
+}
+
+_reserve() {
+	_log_info "Disabling turbo and moving housekeeping to CPUs [${_housekeeping_cpus}]..."
+	_set_turbo off
+	local _unit
+	for _unit in "${_units[@]}"; do
+		systemctl set-property --runtime "${_unit}" AllowedCPUs="${_housekeeping_cpus}"
+	done
+	_set_user_manager_affinity "${_housekeeping_cpus}"
+}
+
+_restore() {
+	_log_info "Restoring CPU affinity and turbo..."
+	local _unit
+	for _unit in "${_units[@]}"; do
+		# Clearing AllowedCPUs= alone leaves running processes with their narrowed affinity: widen it first.
+		systemctl set-property --runtime "${_unit}" AllowedCPUs="${_all_cpus}" || true
+		systemctl set-property --runtime "${_unit}" AllowedCPUs= || true
+	done
+	_set_user_manager_affinity "${_all_cpus}"
+	_set_turbo on || true
+	_log_info "Restored."
+}
+
+_log_machine_state() {
+	_log_info "CPU [$(lscpu | sed -n 's/^Model name: *//p')], kernel [$(uname -r)], turbo [$(_turbo_state)]."
+	test -e /dev/cpu/0/msr || modprobe msr 2>/dev/null || true
+	grep -q GenuineIntel /proc/cpuinfo || return 0
+	local _values
+	_values="$("$(dirname "${0}")/msr-prefetch" --cpus "${_bench_cpus}" get | tr '\n' ' ')"
+	_log_info "MSR 0x1a4 on the benchmark CPUs: [${_values}]."
+}
+
+_set_turbo() {
+	local _state="${1}"
+	test -w "${_intel_turbo}" && { test "${_state}" = off && echo 1 || echo 0; } > "${_intel_turbo}" && return 0
+	test -w "${_amd_boost}" && { test "${_state}" = off && echo 0 || echo 1; } > "${_amd_boost}" && return 0
+	_log_warn "No turbo/boost control found; leaving it unchanged."
+}
+
+_turbo_state() {
+	test -r "${_intel_turbo}" && { test "$(cat "${_intel_turbo}")" = 1 && echo off || echo on; } && return 0
+	test -r "${_amd_boost}" && { test "$(cat "${_amd_boost}")" = 0 && echo off || echo on; } && return 0
+	echo unknown
+}
+
+# Per-user managers (user@UID.service) have no cpuset delegated, so AllowedCPUs= on user.slice does not reach them.
+_set_user_manager_affinity() {
+	local _cpus="${1}" _thread
+	for _thread in $(find /sys/fs/cgroup/user.slice -path '*user@*.service*' -name cgroup.threads \
+		-exec cat {} + 2>/dev/null); do
+		taskset -cp "${_cpus}" "${_thread}" > /dev/null 2>&1 || true
+	done
+}
+
+_fail() { _log_error "${1}"; exit 1; }
+
+_log_info()  { _log "[INFO] ${1}"; }
+_log_warn()  { _log "[WARN] ${1}"; }
+_log_error() { _log "[ERROR] ${1}"; }
+_log()       { echo "$(date -u '+%Y-%m-%d %H:%M:%SZ') ${1}" >&2; }
+
+_main "$@"

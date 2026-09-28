@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Runs benchmark variants in shuffled order across rounds, so that machine-state drift spreads evenly across them, then
+# compares them with benchstat. Build each variant as a test binary first (`go test -c -o base.test .`), so that
+# nothing compiles during timed runs.
+#
+# Usage:
+#   bench/interleave --rounds 10 --output results \
+#     --set '0,2,4,6:4:Sequencer/(SP|Reserve|NextWrapPoint|Commit)' \
+#     --set '0,2,4,6,8,10,12,14:8:SharedSequencer/MP' \
+#     base=./base.test candidate=./candidate.test
+#
+#   --set CPUS:GOMAXPROCS:REGEX[:BINARY]   one benchmark invocation per variant per round: pinned to CPUS with taskset,
+#                                         run with -test.cpu GOMAXPROCS and -test.bench REGEX. BINARY, when given,
+#                                         replaces the variant's own binary (e.g. bench/prefetch's PairChase control).
+#   NAME=BINARY[@MASK]                    a variant. @MASK sets the prefetcher MSR (see bench/msr-prefetch) on
+#                                         --mask-cpus before each of this variant's runs, and requires root; variants
+#                                         without a mask run with the original MSR values.
+#   --mask-cpus CPUS                      the CPUs whose prefetcher MSR the masks apply to (include SMT siblings).
+#   --benchstat PATH                      benchstat binary (default: found on PATH, else the comparison is skipped).
+#
+# Results: NAME.txt per variant, environment.txt (machine and prefetcher state), and benchstat.txt in --output. As
+# root (under bench/reserve), the benchmarks and benchstat run as ${SUDO_USER}, and --output is chowned to them.
+
+readonly _msr_prefetch="$(cd "$(dirname "${0}")" && pwd)/msr-prefetch"
+_rounds=10
+_output=""
+_mask_cpus=""
+_benchstat="$(command -v benchstat || true)"
+_sets=()
+_names=()
+_binaries=()
+_masks=()
+_original_msr=""
+
+_main() {
+	_parse_arguments "$@"
+	_validate
+	mkdir -p "${_output}"
+	local _name
+	for _name in "${_names[@]}"; do
+		rm -f "${_output}/${_name}.txt"
+	done
+	_uses_masks && _original_msr="$("${_msr_prefetch}" --cpus "${_mask_cpus}" get)" && trap _restore_msr EXIT
+	_record_environment > "${_output}/environment.txt"
+	_run_rounds
+	_compare
+}
+
+_run_rounds() {
+	local _round _index _set
+	for _round in $(seq "${_rounds}"); do
+		for _index in $(seq 0 $((${#_names[@]} - 1)) | shuf); do
+			_log_info "Round [${_round}/${_rounds}] variant [${_names[${_index}]}]..."
+			_apply_mask "${_masks[${_index}]}"
+			for _set in "${_sets[@]}"; do
+				_run_set "${_set}" "${_binaries[${_index}]}" >> "${_output}/${_names[${_index}]}.txt"
+			done
+		done
+	done
+}
+
+_run_set() {
+	local _set="${1}" _variant_binary="${2}" _cpus _gomaxprocs _pattern _binary
+	IFS=: read -r _cpus _gomaxprocs _pattern _binary <<< "${_set}"
+	_as_user taskset -c "${_cpus}" "${_binary:-${_variant_binary}}" -test.run '^$' -test.count 1 \
+		-test.cpu "${_gomaxprocs}" -test.bench "${_pattern}"
+}
+
+_compare() {
+	local _files=() _name
+	for _name in "${_names[@]}"; do
+		_files+=("${_output}/${_name}.txt")
+	done
+	test -n "${_benchstat}" || {
+		_owns_output
+		_log_warn "benchstat not found; compare with: benchstat ${_files[*]}"
+		return 0
+	}
+	_as_user "${_benchstat}" "${_files[@]}" > "${_output}/benchstat.txt"
+	_owns_output
+	_log_info "Results written to [${_output}/benchstat.txt]."
+}
+
+_apply_mask() {
+	local _mask="${1}"
+	_uses_masks || return 0
+	test -n "${_mask}" || { builtin printf '%s\n' "${_original_msr}" | "${_msr_prefetch}" restore; return 0; }
+	"${_msr_prefetch}" --cpus "${_mask_cpus}" set "${_mask}" > /dev/null
+}
+
+_restore_msr() {
+	builtin printf '%s\n' "${_original_msr}" | "${_msr_prefetch}" restore || true
+	_log_info "Restored MSR 0x1a4: [$("${_msr_prefetch}" --cpus "${_mask_cpus}" get | tr '\n' ' ')]."
+}
+
+_record_environment() {
+	local _index
+	echo "date: $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+	echo "host: $(uname -n)"
+	echo "cpu: $(lscpu | sed -n 's/^Model name: *//p')"
+	echo "kernel: $(uname -r)"
+	echo "turbo: $(_turbo_state)"
+	test "$(id -u)" -eq 0 && grep -q GenuineIntel /proc/cpuinfo && test -e /dev/cpu/0/msr &&
+		echo "msr 0x1a4: $("${_msr_prefetch}" --cpus "$(cat /sys/devices/system/cpu/online)" get | tr '\n' ' ')"
+	echo "rounds: ${_rounds}"
+	builtin printf 'set: %s\n' "${_sets[@]}"
+	for _index in $(seq 0 $((${#_names[@]} - 1))); do
+		echo "variant: ${_names[${_index}]}=${_binaries[${_index}]} mask=${_masks[${_index}]:-original}" \
+			"built with $(go version "${_binaries[${_index}]}" 2>/dev/null | cut -d' ' -f2- || echo unknown)"
+	done
+}
+
+_parse_arguments() {
+	while test "$#" -gt 0; do
+		case "${1}" in
+		--rounds) _rounds="${2}"; shift 2 ;;
+		--output) _output="${2}"; shift 2 ;;
+		--set) _sets+=("${2}"); shift 2 ;;
+		--mask-cpus) _mask_cpus="${2}"; shift 2 ;;
+		--benchstat) _benchstat="${2}"; shift 2 ;;
+		--*) _fail "Unknown option [${1}]." ;;
+		*=*) _add_variant "${1}"; shift ;;
+		*) _fail "Unrecognized argument [${1}]; variants are NAME=BINARY[@MASK]." ;;
+		esac
+	done
+}
+
+_add_variant() {
+	local _spec="${1}" _rest
+	_rest="${_spec#*=}"
+	_names+=("${_spec%%=*}")
+	_binaries+=("${_rest%@*}")
+	test "${_rest}" != "${_rest%@*}" && _masks+=("${_rest##*@}") || _masks+=("")
+}
+
+_validate() {
+	local _binary
+	test -n "${_output}" || _fail "Missing --output."
+	test "${#_sets[@]}" -gt 0 || _fail "Missing at least one --set."
+	test "${#_names[@]}" -gt 0 || _fail "Missing at least one NAME=BINARY variant."
+	for _binary in "${_binaries[@]}"; do
+		test -x "${_binary}" || _fail "Variant binary [${_binary}] is not executable."
+	done
+	_uses_masks || return 0
+	test "$(id -u)" -eq 0 || _fail "Prefetcher masks require root; run under bench/reserve."
+	test -n "${_mask_cpus}" || _fail "Prefetcher masks require --mask-cpus."
+	grep -q GenuineIntel /proc/cpuinfo || _fail "Prefetcher masks are only supported on Intel CPUs."
+	test -e /dev/cpu/0/msr || modprobe msr
+}
+
+_uses_masks() {
+	local _mask
+	for _mask in "${_masks[@]}"; do
+		test -n "${_mask}" && return 0
+	done
+	return 1
+}
+
+_turbo_state() {
+	local _intel="/sys/devices/system/cpu/intel_pstate/no_turbo" _amd="/sys/devices/system/cpu/cpufreq/boost"
+	test -r "${_intel}" && { test "$(cat "${_intel}")" = 1 && echo off || echo on; } && return 0
+	test -r "${_amd}" && { test "$(cat "${_amd}")" = 0 && echo off || echo on; } && return 0
+	echo unknown
+}
+
+# As root (under bench/reserve), benchmarks run as the invoking user, and the results belong to them. This uses setpriv,
+# not runuser or su: those open a PAM session, and pam_systemd then moves the process into a new session scope under
+# user.slice, off the reserved CPUs (taskset then fails with EINVAL). setpriv changes identity and nothing else.
+_as_user() {
+	test "$(id -u)" -eq 0 && test -n "${SUDO_USER:-}" && {
+		setpriv --reuid="${SUDO_USER}" --regid="$(id -g "${SUDO_USER}")" --init-groups --reset-env -- "$@"
+		return
+	}
+	"$@"
+}
+
+_owns_output() {
+	test "$(id -u)" -eq 0 && test -n "${SUDO_USER:-}" && chown -R "${SUDO_USER}:" "${_output}"
+	return 0
+}
+
+_fail() { _log_error "${1}"; exit 1; }
+
+_log_info()  { _log "[INFO] ${1}"; }
+_log_warn()  { _log "[WARN] ${1}"; }
+_log_error() { _log "[ERROR] ${1}"; }
+_log()       { echo "$(date -u '+%Y-%m-%d %H:%M:%SZ') ${1}" >&2; }
+
+_main "$@"

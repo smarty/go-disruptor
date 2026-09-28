@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Reads or writes MSR_MISC_FEATURE_CONTROL (0x1a4), the hardware prefetcher controls on Intel cores.
+
+Usage (as root):
+	msr-prefetch --cpus 0-15 get              prints "cpu<N> 0x<value>" per CPU
+	msr-prefetch --cpus 0-15 set 0x23         writes the mask to every CPU, then prints the values read back
+	msr-prefetch restore < saved.txt          writes back values previously printed by "get"
+
+Bits as measured on Golden Cove P-cores (i7-12700K, 2026-09-27); the documented meanings of bits 0-3 are Intel's:
+	bit 0  L2 streamer              accepted; little effect on neighbouring-line fetches
+	bit 1  L2 adjacent-line         accepted; NO measurable effect, despite being the documented adjacent-line control
+	bit 2  L1 next-line             accepted; little effect
+	bit 3  L1 IP-stride             accepted; little effect
+	bit 4  (undocumented here)      accepted; no measurable effect
+	bit 5  (listed as "AMP")        accepted; carries the neighbouring-line fetch: setting it alone doubles PairChase
+	bit 6  (E-core LLC page)        rejected by the CPU (EIO)
+	bit 7  (E-core AOP)             rejected by the CPU (EIO)
+Mask 0x23 (bits 0, 1, and 5) turns off every prefetcher found to matter. Gracemont E-cores use a different layout.
+A setting lasts until it is rewritten or the machine reboots; the SMT siblings of a core share its L2, so set both.
+"""
+import argparse
+import os
+import struct
+import sys
+
+MSR_MISC_FEATURE_CONTROL = 0x1A4
+
+
+def main():
+	arguments = parse_arguments()
+	if arguments.action == "restore":
+		for line in sys.stdin:
+			if line.strip():
+				cpu, value = line.split()
+				write_msr(int(cpu.removeprefix("cpu")), int(value, 16))
+		return
+
+	cpus = parse_cpu_list(arguments.cpus)
+	if arguments.action == "set":
+		for cpu in cpus:
+			write_msr(cpu, int(arguments.mask, 16))
+	for cpu in cpus:
+		print(f"cpu{cpu} 0x{read_msr(cpu):x}")
+
+
+def parse_arguments():
+	parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+	parser.add_argument("--cpus", help="CPU list, e.g. 0-15 or 0,2,4,6 (required for get and set)")
+	parser.add_argument("action", choices=["get", "set", "restore"])
+	parser.add_argument("mask", nargs="?", help="hexadecimal mask for set, e.g. 0x23")
+	arguments = parser.parse_args()
+	if arguments.action in ("get", "set") and not arguments.cpus:
+		parser.error("--cpus is required for get and set")
+	if arguments.action == "set" and not arguments.mask:
+		parser.error("set requires a mask")
+	return arguments
+
+
+def parse_cpu_list(text):
+	cpus = []
+	for part in text.split(","):
+		first, _, last = part.partition("-")
+		cpus.extend(range(int(first), int(last or first) + 1))
+	return cpus
+
+
+def open_msr(cpu, flags):
+	try:
+		return os.open(f"/dev/cpu/{cpu}/msr", flags)
+	except PermissionError:
+		sys.exit("Reading or writing MSRs requires root.")
+	except FileNotFoundError:
+		sys.exit(f"No MSR device for cpu{cpu}; load the msr module (modprobe msr).")
+
+
+def read_msr(cpu):
+	descriptor = open_msr(cpu, os.O_RDONLY)
+	try:
+		value, = struct.unpack("<Q", os.pread(descriptor, 8, MSR_MISC_FEATURE_CONTROL))
+		return value
+	finally:
+		os.close(descriptor)
+
+
+def write_msr(cpu, value):
+	descriptor = open_msr(cpu, os.O_WRONLY)
+	try:
+		os.pwrite(descriptor, struct.pack("<Q", value), MSR_MISC_FEATURE_CONTROL)
+	except OSError as error:
+		sys.exit(f"The CPU rejected mask [0x{value:x}] on cpu{cpu}: {error}.")
+	finally:
+		os.close(descriptor)
+
+
+main()
