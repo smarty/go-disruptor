@@ -86,7 +86,8 @@ array) and indexes into it using `sequence & mask`.
   int64 sequences never wrap, so a marker can go unrewritten for any number of laps). This relies on every `Load`
   starting at a batch boundary, which holds because callers only pass `handledSequence+1` (see the struct comment).
   `Load` advances single-slot batches with `lower++` behind a branch, not `lower = marker+1`, to avoid a serial
-  dependent-load chain (see Performance Findings). `cachedConsumerSequence` is
+  dependent-load chain (see Performance Findings). `Load` reads the first marker before `reservedSequence` and returns
+  at once when it is stale, so an empty poll never touches the writers' contended line. `cachedConsumerSequence` is
   `*atomicSequence` (atomic because multiple writers may update it concurrently). Also implements `sequenceBarrier`
   (the `Load` method).
 - **`listener.go`** — Runs a consumer loop (blocks calling goroutine). Has two barriers: `committedBarrier` (how far
@@ -187,6 +188,12 @@ goroutine placement across CCXs varies per run, so only large, replicated multi-
   single-producer variance of ±10-35% fell to ±0-2%. In an unreserved pilot, an unsafe inline plain store (the upper
   bound) beat the stub by only another ~10 points, so the non-inlinable call keeps about three quarters of the gain.
   Untested on Zen 2.
+- **Adopted — shared `Load` returns early on an empty poll** (first marker stale, so `reservedSequence` is never read).
+  With the opt-in busy-spin strategy (next commit), the shared sequencer with one writer went from 25.5 to 11.5ns
+  (pilot). With the default strategy, reserved (`bench/compare`, 10 rounds): `MP MC/R1` -4.8%, `MP MC/R4` -7.3%, other
+  multi-producer rows unchanged, the shared sequencer driven by one writer +1.6%, geomean -2.2%; an unreserved pilot
+  also showed the 1K ring 28% faster. Single-writer rows got 5-9% faster (and `Sequencer/Commit` 2.3% slower) between
+  the two binaries with no code change: treat that size as layout noise.
 - **Adopted — `BufferCapacity` required, 64K recommended (the default was 1024).** A ring must hold more events than
   producers publish while a sleeping consumer wakes: `time.Sleep(500ns)` in `Idle` takes ~1.9us median and ~9us p99 on
   the i7-12700K. At 1K slots a batching single writer (R16) was 23x slower than at 16K (7.9ns vs 0.34ns), with consumers
