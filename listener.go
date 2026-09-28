@@ -17,14 +17,19 @@ import (
 //     configured Sequencer.
 //
 //   - committedBarrier: a barrier representing how far all producers (via the configured Sequencer instance) have
-//     committed. The value is read on each iteration to detect when data has been written but the prior Handler
-//     group has not yet advanced. This means that this Listener is in a "gated" state and that new work is
-//     imminent.
+//     committed. When gated, the value is read on each empty iteration to detect when data has been written but the
+//     prior Handler group has not yet advanced. This means that this Listener is in a "gated" state and that new work
+//     is imminent. It is also re-read after observing Close, so that commits preceding Close are drained.
 //
 //   - upstreamBarrier: a barrier representing the minimum sequence position across the prior Handler group. The
 //     value is read on each iteration to determine how far this Listener is allowed to advance. If this instance is
 //     part of the first Handler group, the value points directly at the committed barrier of the configured
 //     Sequencer.
+//
+//   - gated: whether a prior Handler group exists, i.e. whether upstreamBarrier differs from committedBarrier. For the
+//     first Handler group both are the same barrier, so the gated check would only re-read the barrier that was just
+//     found empty; skipping it saves a second barrier read (a scan of committedSlots in the shared sequencer) on every
+//     empty iteration, and avoids a needless Gate when a commit lands between the two reads.
 //
 //   - waiter: the WaitStrategy whose Gate and Idle methods are called during the gated and idle states
 //     respectively.
@@ -36,16 +41,18 @@ type defaultListener struct {
 	handledSequence  *atomicSequence
 	committedBarrier sequenceBarrier
 	upstreamBarrier  sequenceBarrier
+	gated            bool
 	waiter           WaitStrategy
 	handler          Handler
 }
 
-func newListener(handledSequence *atomicSequence, committedBarrier, upstreamBarrier sequenceBarrier, waiter WaitStrategy, handler Handler) ListenCloser {
+func newListener(handledSequence *atomicSequence, committedBarrier, upstreamBarrier sequenceBarrier, gated bool, waiter WaitStrategy, handler Handler) ListenCloser {
 	return &defaultListener{
 		running:          &atomic.Int64{},
 		handledSequence:  handledSequence,
 		committedBarrier: committedBarrier,
 		upstreamBarrier:  upstreamBarrier,
+		gated:            gated,
 		waiter:           waiter,
 		handler:          handler,
 	}
@@ -65,7 +72,7 @@ func (this *defaultListener) Listen() {
 			handledSequence = upperSequence
 			gatedCount = 0
 			idlingCount = 0
-		} else if upperSequence = this.committedBarrier.Load(lowerSequence); lowerSequence <= upperSequence {
+		} else if this.gated && lowerSequence <= this.committedBarrier.Load(lowerSequence) {
 			gatedCount++
 			idlingCount = 0
 			this.waiter.Gate(gatedCount)
@@ -74,8 +81,9 @@ func (this *defaultListener) Listen() {
 			gatedCount = 0
 			this.waiter.Idle(idlingCount)
 		} else if upperSequence = this.committedBarrier.Load(lowerSequence); lowerSequence > upperSequence {
-			// Close was observed only *after* the committed barrier was checked above, so any Commit that preceded
-			// Close may have landed in between; re-checking here guarantees those events are drained, not dropped.
+			// Close was observed only *after* the barriers were read above (the upstream barrier, which is the committed
+			// barrier for the first group, and the committed barrier when gated), so any Commit that preceded Close may
+			// have landed in between; re-checking here guarantees those events are drained, not dropped.
 			break
 		}
 	}

@@ -36,12 +36,6 @@ forgets to check the return value will use -1 or -2 as a sequence number, silent
 `(-1 & mask)` or `(-2 & mask)`—corrupting data with no signal. Java throws `InsufficientCapacityException`. The current
 API makes misuse easy and silent.
 
-### Redundant barrier check for first handler group
-
-In `listener.go:60`, for the first handler group, `upstreamBarrier` and `committedBarrier` are the same object (both set
-to `committedBarrier` in `config.go:34`). So the gated branch (`else if upperSequence = this.committedBarrier.Load(...)`)
-is unreachable for group 0—it will always return the same result as the first check. Minor waste, not a bug.
-
 ### Release stores for `Commit` via an amd64 assembly stub
 
 `Commit` is the only Commit→Load ordering edge in each sequencer (`committedSequence` for the single producer,

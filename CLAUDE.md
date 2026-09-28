@@ -83,9 +83,11 @@ array) and indexes into it using `sequence & mask`.
   `*atomicSequence` (atomic because multiple writers may update it concurrently). Also implements `sequenceBarrier`
   (the `Load` method).
 - **`listener.go`** — Runs a consumer loop (blocks calling goroutine). Has two barriers: `committedBarrier` (how far
-  producers have committed) and `upstreamBarrier` (how far the prior handler group has advanced). Uses `WaitStrategy`
-  for backpressure. Closed state tracked via `*atomic.Int64` with `stateRunning`/`stateClosed` constants. Close is a
-  graceful drain — the listener continues processing committed events before exiting.
+  producers have committed) and `upstreamBarrier` (how far the prior handler group has advanced). For the first group
+  both are the same barrier, so `gated` is false and the empty path skips the committed-barrier (`Gate`) check; the
+  drain re-check after observing Close still runs for every group. Uses `WaitStrategy` for backpressure. Closed state
+  tracked via `*atomic.Int64` with `stateRunning`/`stateClosed` constants. Close is a graceful drain — the listener
+  continues processing committed events before exiting.
 - **`listener_composite.go`** — Slice type (`type compositeListener []ListenCloser`). Manages multiple listeners with
   WaitGroup coordination. Constructor unwraps single-element slices to avoid indirection.
 - **`sequence_barrier.go`** — `sequenceBarrier` interface (`Load(int64) int64`) and `atomicBarrier`: single-sequence

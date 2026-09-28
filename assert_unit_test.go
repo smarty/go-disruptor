@@ -54,12 +54,48 @@ func TestListen_DrainsCommitRacingWithClose(t *testing.T) {
 	handled := int64(defaultSequenceValue)
 	var listener ListenCloser
 	barrier := &racingCommitBarrier{committed: committed, listener: &listener}
-	listener = newListener(newSequence(), barrier, newAtomicBarrier(committed), defaultWaitStrategy{}, recordingHandler{handled: &handled})
+	listener = newListener(newSequence(), barrier, newAtomicBarrier(committed), true, defaultWaitStrategy{}, recordingHandler{handled: &handled})
 
 	listener.Listen()
 
 	if handled != 0 {
 		t.Fatalf("sequence 0 was committed before Close but never handled; handled=%d", handled)
+	}
+}
+func TestListen_FirstGroupDrainsCommitRacingWithClose(t *testing.T) {
+	// The first handler group reads one barrier as both upstream and committed, and skips the gated check: the
+	// producer commits sequence 0 and calls Close right after that single read, before the running flag is read.
+	committed := newSequence()
+	handled := int64(defaultSequenceValue)
+	var listener ListenCloser
+	barrier := &racingCommitBarrier{committed: committed, listener: &listener}
+	listener = newListener(newSequence(), barrier, barrier, false, defaultWaitStrategy{}, recordingHandler{handled: &handled})
+
+	listener.Listen()
+
+	if handled != 0 {
+		t.Fatalf("sequence 0 was committed before Close but never handled; handled=%d", handled)
+	}
+}
+func TestListen_OnlyGatedListenersCallGate(t *testing.T) {
+	// A commit lands right after the listener's first barrier read. A gated listener sees it on its committed-barrier
+	// check and calls Gate; the first group has no upstream group to wait for, so it must go straight on to Idle.
+	for _, gated := range []bool{true, false} {
+		committed := newSequence()
+		handled := int64(defaultSequenceValue)
+		var listener ListenCloser
+		barrier := &committingBarrier{committed: committed}
+		waiter := &closingWaitStrategy{listener: &listener}
+		listener = newListener(newSequence(), barrier, barrier, gated, waiter, recordingHandler{handled: &handled})
+
+		listener.Listen()
+
+		if expected := map[bool]int{true: 1, false: 0}[gated]; waiter.gates != expected {
+			t.Fatalf("gated=%v: expected %d Gate calls, got %d", gated, expected, waiter.gates)
+		}
+		if handled != 0 {
+			t.Fatalf("gated=%v: sequence 0 was never handled; handled=%d", gated, handled)
+		}
 	}
 }
 
@@ -357,6 +393,31 @@ func (this *racingCommitBarrier) Load(_ int64) int64 {
 	}
 	return value
 }
+
+// committingBarrier simulates a producer that commits sequence 0 immediately after the listener's first barrier read.
+type committingBarrier struct {
+	committed *atomicSequence
+	fired     bool
+}
+
+func (this *committingBarrier) Load(_ int64) int64 {
+	value := this.committed.Load()
+	if !this.fired {
+		this.fired = true
+		this.committed.Store(0) // producer: Commit(0, 0)
+	}
+	return value
+}
+
+// closingWaitStrategy counts Gate calls and closes the listener the first time it idles.
+type closingWaitStrategy struct {
+	defaultWaitStrategy
+	listener *ListenCloser
+	gates    int
+}
+
+func (this *closingWaitStrategy) Gate(int64) { this.gates++ }
+func (this *closingWaitStrategy) Idle(int64) { _ = (*this.listener).Close() }
 
 type orderingHandler struct {
 	ring    []atomic.Int64

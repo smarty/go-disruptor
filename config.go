@@ -47,7 +47,7 @@ func (this configuration) newListeners(committedBarrier sequenceBarrier) (listen
 		group := make([]ListenCloser, len(handlers))
 		for handlerIndex, handler := range handlers {
 			sequences[handlerIndex] = allSequences[offset+handlerIndex]
-			group[handlerIndex] = newListener(sequences[handlerIndex], committedBarrier, handledBarrier, this.WaitStrategy, handler)
+			group[handlerIndex] = newListener(sequences[handlerIndex], committedBarrier, handledBarrier, groupIndex > 0, this.WaitStrategy, handler)
 		}
 		handledBarrier = newCompositeBarrier(sequences...) // next group cannot handle beyond the sequences the current group have handled.
 		listeners[groupIndex] = newCompositeListener(group)
