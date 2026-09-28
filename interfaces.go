@@ -53,6 +53,12 @@ type Sequencer interface {
 	// uppermost sequence returned. If the number of desired slots is larger than the capacity of the ring buffer,
 	// ErrReservationSize is returned.
 	//
+	// Reserve several slots at once whenever events arrive faster than one at a time. The synchronization cost is paid
+	// per call, not per slot: one atomic add (a contended LOCK XADD shared by every writer) in the shared Sequencer and
+	// one commit store in either Sequencer. With multiple writers this is the main performance lever; reserving 16 slots
+	// at a time is roughly ten times faster per event than reserving one. Keep the work between Reserve and Commit
+	// short, because consumers cannot advance past a reserved slot until its batch is committed.
+	//
 	// Each successful call to Reserve should *always* be followed by a single call to Commit.
 	Reserve(slots uint32) (upperSequence int64)
 

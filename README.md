@@ -160,7 +160,7 @@ Traditional concurrent queues (including Go channels) suffer from several perfor
 
 - **Mechanical sympathy.** The Disruptor is designed around how modern CPUs actually work. The ring buffer is contiguous in memory, so sequential access follows the CPU's prefetch pattern. Sequence counters are padded to occupy their own cache lines, preventing false sharing&mdash;a phenomenon where two independent variables on the same cache line (typically 64 bytes, though processor-dependent) cause the CPU cores to constantly invalidate each other's caches.
 
-- **Batching.** When a consumer falls behind, it can process multiple entries in a single call (`Handle(lower, upper)`), amortizing the overhead of synchronization across many items. This is why the "Reserve 16" benchmarks are dramatically faster per operation than "Reserve 1."
+- **Batching.** Both sides amortize synchronization across many items. A producer can reserve and commit several slots in one call (`Reserve(16)`), and a consumer that falls behind processes every available entry in a single call (`Handle(lower, upper)`). Producer batching is why the "Reserve 16" benchmarks are dramatically faster per operation than "Reserve 1."
 
 ### Handler Groups and Pipelines
 
@@ -169,3 +169,16 @@ Consumers are organized into handler groups that form a processing pipeline. Wit
 ### Single-Writer vs Multi-Writer
 
 With a single producer (`WriterCount(1)`), the sequencer needs no atomic read-modify-write operations: `Reserve` only updates plain fields owned by the one producer goroutine, and `Commit` is a single uncontended atomic store that publishes the written slots to consumers. That store is still the most expensive step on the path (on x86 it compiles to `XCHG`, a full memory barrier), which is why reserving and committing in batches pays off even for a single producer. With multiple producers (`WriterCount(2+)`), the sequencer uses atomic add to claim slots and per-batch commit markers to handle out-of-order commits from concurrent writers. The single-writer path is significantly faster, so prefer it when your architecture allows a single producer goroutine.
+
+With multiple writers, batching is the main performance lever. Every `Reserve` call performs one atomic add on a counter shared by all writers, and every `Commit` call one store, regardless of how many slots the call covers; at one slot per call, four writers spend most of their time contending for that counter's cache line (32.3 ns per event in the benchmarks below, against 3.1 ns when reserving 16 slots at a time). When events arrive in bursts, or can be accumulated briefly, reserve them together:
+
+```go
+upperReservation := instance.Reserve(uint32(len(events)))
+lowerReservation := upperReservation - int64(len(events)) + 1
+for sequence := lowerReservation; sequence <= upperReservation; sequence++ {
+	ringBuffer[sequence&bufferMask] = events[sequence-lowerReservation]
+}
+instance.Commit(lowerReservation, upperReservation)
+```
+
+Keep the work between `Reserve` and `Commit` short: consumers cannot advance past a reserved slot until its batch is committed, so one slow writer holding a large batch stalls every event behind it. A batch can be no larger than the buffer capacity.
