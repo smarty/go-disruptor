@@ -49,9 +49,9 @@ type Sequencer interface {
 	// because any configured Handlers have properly processed all necessary data in those slots, the Sequencer returns
 	// the uppermost or highest sequence of the slots claimed and reserved for the caller.
 	//
-	// The lower-bound sequence in the ring buffer is obtained by subtracting the specified number of slots from the
-	// uppermost sequence returned. If the number of desired slots is larger than the capacity of the ring buffer,
-	// ErrReservationSize is returned.
+	// The lower-bound sequence in the ring buffer is the uppermost sequence returned, minus the specified number of
+	// slots, plus one (lower = upper - slots + 1). If the number of desired slots is larger than the capacity of the ring
+	// buffer, ErrReservationSize is returned.
 	//
 	// Reserve several slots at once whenever events arrive faster than one at a time. The synchronization cost is paid
 	// per call, not per slot: one atomic add (a contended LOCK XADD shared by every writer) in the shared Sequencer and
