@@ -10,7 +10,7 @@ set -euo pipefail
 # Steps:
 #   validate   one round: prefetchers on vs off (MSR 0x1a4 = 0x23) with the PairChase control, asserting that the
 #              switch took effect (PairChase at least 1.3x slower off) before any long run starts. ~1 minute.
-#   baseline   10 rounds of the capacity sweeps, ring-buffer, and wake-latency benchmarks, prefetchers untouched.
+#   baseline   10 rounds of the sequencer, capacity, ring-buffer, wake-latency, busy-spin, and idle-CPU benchmarks.
 #   prefetch   10 rounds of the same benchmarks, prefetchers on vs off, with the PairChase control. ~10 minutes.
 #
 # Options (defaults are the i7-12700K layout; any other CPU must pass all of them):
@@ -102,8 +102,8 @@ _build() {
 	(cd "${_repository}" && go test -c -o "${_output}/bin/base.test" . &&
 		go test -c -o "${_output}/bin/control.test" ./bench/prefetch)
 	_benchmark_sets=(
-		--set "${_single_producer_cpus}:4:(SequencerCapacity|RingBuffer|WakeLatency)/SP"
-		--set "${_multi_producer_cpus}:8:(SequencerCapacity|RingBuffer)/MP"
+		--set "${_single_producer_cpus}:4:(Sequencer|RingBuffer|WakeLatency|BusySpin|IdleCPU)/(SP|Default|BusySpin)"
+		--set "${_multi_producer_cpus}:8:(Sequencer|RingBuffer|BusySpin)/MP"
 	)
 }
 

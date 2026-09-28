@@ -18,7 +18,8 @@ type ListenCloser interface {
 }
 
 // WaitStrategy provides pluggable backpressure for both producers and consumers. The default implementation uses
-// runtime.Gosched for Gate, time.Sleep(500ns) for Idle, and time.Sleep(1ns) for Reserve.
+// runtime.Gosched for Gate, time.Sleep(500ns) for Idle, and time.Sleep(1ns) for Reserve. BusySpinWaitStrategy trades a
+// dedicated CPU per waiting goroutine for sub-microsecond wake-ups.
 type WaitStrategy interface {
 	// Gate is invoked when data has been committed to the ring buffer by a producer but the prior Handler group has
 	// not yet finished processing it. This means new work is imminent and the Listener should wait briefly.

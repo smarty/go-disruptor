@@ -18,10 +18,10 @@ variants in shuffled order across rounds, and compare with `benchstat`
 
 `bench/suite` (run as yourself; it calls `sudo` per step) builds the binaries and runs three steps, writing to
 `/tmp/go-disruptor-bench/<UTC timestamp>/<step>/`: `validate` (one round, asserting that reservation works and that
-switching the prefetchers off slows `PairChase` by at least 1.3x), `baseline` (10 rounds of the capacity sweeps,
-ring-buffer, and wake-latency benchmarks), and `prefetch` (the same benchmarks, prefetchers on vs off, with the
-control). Run one step with `bench/suite baseline`. The CPU layout defaults to the i7-12700K; any other CPU must pass
-every CPU option.
+switching the prefetchers off slows `PairChase` by at least 1.3x), `baseline` (10 rounds of the sequencer, capacity,
+ring-buffer, wake-latency, busy-spin, and idle-CPU benchmarks, with both wait strategies side by side), and `prefetch`
+(the same benchmarks, prefetchers on vs off, with the control). Run one step with `bench/suite baseline`. The CPU layout
+defaults to the i7-12700K; any other CPU must pass every CPU option.
 
 Note that `-test.bench` splits its pattern on `/` per sub-benchmark level, except inside parentheses: select two
 benchmark families with `(SequencerCapacity|RingBuffer)/SP`, not `SequencerCapacity/SP|RingBuffer/SP`.

@@ -2,6 +2,7 @@ package disruptor
 
 import (
 	"math/rand/v2"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -296,18 +297,27 @@ func TestSharedLoad_RejectsMarkerStaleForManyLaps(t *testing.T) {
 
 // Concurrent writers reserving random batch sizes across many laps of a small ring buffer, through a two-group
 // pipeline; every handler must observe every sequence exactly once, in order, with the value the writer stored.
-func TestShared_RandomBatchesAcrossLaps(t *testing.T) {
+func TestShared_RandomBatchesAcrossLaps(t *testing.T) { testRandomBatchesAcrossLaps(t, 4, 200_000) }
+func TestBusySpin_RandomBatchesAcrossLaps(t *testing.T) {
+	// Every writer and handler spins without yielding, so each needs a processor of its own (see BusySpinWaitStrategy).
+	// 50,000 sequences still lap the 64-slot ring ~780 times, and keep the -race pass well inside make test's timeout.
+	for _, writers := range []int{1, 4} {
+		if spinning := writers + 4; runtime.GOMAXPROCS(0) <= spinning {
+			t.Skipf("needs GOMAXPROCS > %d for %d spinning goroutines", spinning, spinning)
+		}
+		testRandomBatchesAcrossLaps(t, writers, 50_000, Options.WaitStrategy(BusySpinWaitStrategy{}))
+	}
+}
+func testRandomBatchesAcrossLaps(t *testing.T, writers int, totalSequences int64, options ...option) {
 	const capacity = 64
-	const writers = 4
-	const totalSequences = 200_000
 	var ring [capacity]atomic.Int64
 	handlers := []*orderingHandler{{ring: ring[:]}, {ring: ring[:]}, {ring: ring[:]}, {ring: ring[:]}}
 
-	subject, err := New(
+	subject, err := New(append([]option{
 		Options.BufferCapacity(capacity),
-		Options.WriterCount(writers),
+		Options.WriterCount(uint8(writers)),
 		Options.NewHandlerGroup(handlers[0], handlers[1]),
-		Options.NewHandlerGroup(handlers[2], handlers[3]))
+		Options.NewHandlerGroup(handlers[2], handlers[3])}, options...)...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +356,7 @@ func TestShared_RandomBatchesAcrossLaps(t *testing.T) {
 		if handler.failure != "" {
 			t.Fatalf("handler %d: %s", index, handler.failure)
 		}
-		if handler.handled < totalSequences-writers*16 {
+		if handler.handled < totalSequences-int64(writers)*16 {
 			t.Fatalf("handler %d: handled only %d sequences", index, handler.handled)
 		}
 	}

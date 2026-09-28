@@ -56,6 +56,10 @@ array) and indexes into it using `sequence & mask`.
 - **`config.go`** — `New()` constructor returns `(Disruptor, error)`. Functional options via `Options` singleton.
   `BufferCapacity` is required (no default since v0.5.0's 1024; 65536 recommended). Default wait: `Gosched()` on gate /
   500ns sleep on idle / 1ns sleep on reserve. Also contains `defaultWaitStrategy` and `defaultDisruptor`.
+- **`wait_strategy_spin.go`, `spin_hint_*`** — `BusySpinWaitStrategy` (exported, opt-in): every wait is one
+  `spinHint()`, eight `PAUSE`s on amd64 (eight `YIELD`s on arm64, unmeasured; a no-op elsewhere). Eight, not one: a
+  single `PAUSE` let the polling consumer steal the producer's lines often enough to make the single writer ~40%
+  slower. Needs a dedicated CPU per waiting goroutine.
 - **`sequence.go`** — `atomicSequence`: cache-line-padded `atomic.Int64`. Padding is `[CacheLineBytes - 8]byte` placed
   before the embedded `atomic.Int64` (one-sided padding — the next allocation's leading padding provides the trailing
   separation). `newSequences(count)` over-allocates one extra cache line as a single contiguous `[]byte` and starts the
@@ -188,12 +192,22 @@ goroutine placement across CCXs varies per run, so only large, replicated multi-
   single-producer variance of ±10-35% fell to ±0-2%. In an unreserved pilot, an unsafe inline plain store (the upper
   bound) beat the stub by only another ~10 points, so the non-inlinable call keeps about three quarters of the gain.
   Untested on Zen 2.
+- **Rejected — phased-backoff default wait strategy; adopted — opt-in `BusySpinWaitStrategy`.** Spinning before the
+  default's sleep made dense traffic far faster but latency after idle gaps 2-8x worse (50us gap: median 1.1us to
+  648us): Go parks a thread waiting on a sub-millisecond timer in `epoll` with a 1ms timeout, so no sleep-based idle
+  phase can promise sub-millisecond wake-ups. Busy-spin (P-cores reserved, turbo off, 10 rounds) wakes in 261-413ns at
+  p50 and 296-578ns at p99 at every gap, against the default's 1.5-2.2us p50 and 9us-1.04ms p99; a 1K ring at 16
+  slots runs 13x faster; the single writer is 5-16% slower, four writers 16% slower at R1 and even at R16, and the
+  shared sequencer with one writer 57% slower (polling contention). `BenchmarkWakeLatency` and `BenchmarkBusySpin`
+  measure it. CPU (`BenchmarkIdleCPU`): busy-spin costs exactly 1 core per waiting goroutine, but the default is not
+  free either: an idle default consumer uses 0.55 cores (0.84 for two), because Go's `time.Sleep(500ns)` keeps
+  scheduler threads spinning (`Sleep(50us)` costs 0.02 cores).
 - **Adopted — shared `Load` returns early on an empty poll** (first marker stale, so `reservedSequence` is never read).
-  With the opt-in busy-spin strategy (next commit), the shared sequencer with one writer went from 25.5 to 11.5ns
-  (pilot). With the default strategy, reserved (`bench/compare`, 10 rounds): `MP MC/R1` -4.8%, `MP MC/R4` -7.3%, other
-  multi-producer rows unchanged, the shared sequencer driven by one writer +1.6%, geomean -2.2%; an unreserved pilot
-  also showed the 1K ring 28% faster. Single-writer rows got 5-9% faster (and `Sequencer/Commit` 2.3% slower) between
-  the two binaries with no code change: treat that size as layout noise.
+  With busy-spin, the shared sequencer with one writer went from 25.5 to 11.5ns (pilot). With the default strategy,
+  reserved (`bench/compare`, 10 rounds): `MP MC/R1` -4.8%, `MP MC/R4` -7.3%, other multi-producer rows unchanged, the
+  shared sequencer driven by one writer +1.6%, geomean -2.2%; an unreserved pilot also showed the 1K ring 28% faster.
+  Single-writer rows got 5-9% faster (and `Sequencer/Commit` 2.3% slower) between the two binaries with no code
+  change: treat that size as layout noise.
 - **Adopted — `BufferCapacity` required, 64K recommended (the default was 1024).** A ring must hold more events than
   producers publish while a sleeping consumer wakes: `time.Sleep(500ns)` in `Idle` takes ~1.9us median and ~9us p99 on
   the i7-12700K. At 1K slots a batching single writer (R16) was 23x slower than at 16K (7.9ns vs 0.34ns), with consumers

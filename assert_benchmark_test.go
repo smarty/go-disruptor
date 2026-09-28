@@ -2,6 +2,7 @@ package disruptor
 
 import (
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -186,20 +187,28 @@ func BenchmarkSequencerCapacity(b *testing.B) {
 }
 
 // BenchmarkWakeLatency measures how long a consumer takes to handle a single event published after the ring has been
-// empty for a given gap, which is what the WaitStrategy's Idle phases determine. The producer busy-waits through the
-// gap and for the event to be handled, so the reported latency-ns/op is the consumer's alone (plus ~20ns of clock
-// reads); ns/op includes the gap.
+// empty for a given gap, which is what the WaitStrategy's Idle phase determines. The producer busy-waits through the
+// gap and for the event to be handled, so the latency metrics (mean, p50, and p99, publish to handled) are the
+// consumer's alone (plus ~20ns of clock reads); ns/op includes the gap.
 func BenchmarkWakeLatency(b *testing.B) {
-	for _, gap := range []time.Duration{0, 2 * time.Microsecond, 50 * time.Microsecond} {
-		b.Run(fmt.Sprintf("SP SC/%v", gap), func(b *testing.B) { benchmarkWakeLatency(b, gap, 1) })
-		b.Run(fmt.Sprintf("Shared SP SC/%v", gap), func(b *testing.B) { benchmarkWakeLatency(b, gap, 2) })
+	strategies := []struct {
+		name     string
+		strategy WaitStrategy
+	}{{"Default", defaultWaitStrategy{}}, {"BusySpin", BusySpinWaitStrategy{}}}
+	for _, item := range strategies {
+		for _, gap := range []time.Duration{0, 2 * time.Microsecond, 50 * time.Microsecond} {
+			b.Run(fmt.Sprintf("%s/SP SC/%v", item.name, gap), func(b *testing.B) { benchmarkWakeLatency(b, gap, 1, item.strategy) })
+			b.Run(fmt.Sprintf("%s/Shared SP SC/%v", item.name, gap), func(b *testing.B) { benchmarkWakeLatency(b, gap, 2, item.strategy) })
+		}
 	}
 }
-func benchmarkWakeLatency(b *testing.B, gap time.Duration, writerCount uint8) {
+func benchmarkWakeLatency(b *testing.B, gap time.Duration, writerCount uint8, strategy WaitStrategy) {
 	handler := &handledSequenceHandler{}
 	handler.handled.Store(defaultSequenceValue)
-	disruptor, _ := New(Options.BufferCapacity(ringBufferSize), Options.WriterCount(writerCount), Options.NewHandlerGroup(handler))
+	disruptor, _ := New(Options.BufferCapacity(ringBufferSize), Options.WriterCount(writerCount), Options.WaitStrategy(strategy),
+		Options.NewHandlerGroup(handler))
 	defer disruptor.Listen()
+	latencies := make([]time.Duration, b.N)
 
 	go func() {
 		defer func() { _ = disruptor.Close() }()
@@ -207,8 +216,8 @@ func benchmarkWakeLatency(b *testing.B, gap time.Duration, writerCount uint8) {
 		b.ReportAllocs()
 		b.ResetTimer()
 
-		var latency time.Duration
-		for i := 0; i < b.N; i++ {
+		var total time.Duration
+		for i := range latencies {
 			for idleSince := time.Now(); time.Since(idleSince) < gap; {
 			}
 			published := time.Now()
@@ -216,10 +225,83 @@ func benchmarkWakeLatency(b *testing.B, gap time.Duration, writerCount uint8) {
 			disruptor.Commit(sequence, sequence)
 			for handler.handled.Load() < sequence {
 			}
-			latency += time.Since(published)
+			latencies[i] = time.Since(published)
+			total += latencies[i]
 		}
-		b.ReportMetric(float64(latency.Nanoseconds())/float64(b.N), "latency-ns/op")
+		b.StopTimer()
+		slices.Sort(latencies)
+		b.ReportMetric(float64(total.Nanoseconds())/float64(b.N), "latency-ns/op")
+		b.ReportMetric(float64(latencies[len(latencies)/2].Nanoseconds()), "p50-ns")
+		b.ReportMetric(float64(latencies[len(latencies)*99/100].Nanoseconds()), "p99-ns")
 	}()
+}
+
+// BenchmarkIdleCPU measures what waiting costs in CPU: each op is one millisecond of wall time, during which the
+// producer either publishes nothing (Idle) or one event every 100us (Sparse), and cores/op is the whole process's CPU
+// time divided by the wall time. The benchmark goroutine itself only sleeps, so the figure is the waiting goroutines'.
+func BenchmarkIdleCPU(b *testing.B) {
+	strategies := []struct {
+		name     string
+		strategy WaitStrategy
+	}{{"Default", defaultWaitStrategy{}}, {"BusySpin", BusySpinWaitStrategy{}}}
+	for _, item := range strategies {
+		for _, consumers := range []int{1, 2} {
+			b.Run(fmt.Sprintf("%s/Idle/%dC", item.name, consumers), func(b *testing.B) {
+				benchmarkIdleCPU(b, item.strategy, consumers, 0)
+			})
+			b.Run(fmt.Sprintf("%s/Sparse/%dC", item.name, consumers), func(b *testing.B) {
+				benchmarkIdleCPU(b, item.strategy, consumers, 100*time.Microsecond)
+			})
+		}
+	}
+}
+func benchmarkIdleCPU(b *testing.B, strategy WaitStrategy, consumers int, interval time.Duration) {
+	if _, ok := processCPUTime(); !ok {
+		b.Skip("process CPU time is unavailable on this platform")
+	}
+	handlers := make([]Handler, consumers)
+	for i := range handlers {
+		handlers[i] = nopHandler{}
+	}
+	disruptor, _ := New(Options.BufferCapacity(ringBufferSize), Options.WaitStrategy(strategy), Options.NewHandlerGroup(handlers...))
+	defer disruptor.Listen()
+
+	go func() {
+		defer func() { _ = disruptor.Close() }()
+		time.Sleep(time.Millisecond * 100) // let the Listen goroutines start and settle into waiting
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		startedCPU, _ := processCPUTime()
+		started := time.Now()
+		for deadline := started.Add(time.Duration(b.N) * time.Millisecond); time.Now().Before(deadline); {
+			if interval == 0 {
+				time.Sleep(time.Until(deadline))
+				continue
+			}
+			time.Sleep(interval)
+			sequence := disruptor.Reserve(1)
+			disruptor.Commit(sequence, sequence)
+		}
+		finishedCPU, _ := processCPUTime()
+		b.ReportMetric(float64(finishedCPU-startedCPU)/float64(time.Since(started)), "cores/op")
+	}()
+}
+
+// BenchmarkBusySpin repeats the core throughput shapes with BusySpinWaitStrategy, including the 1K-slot ring that the
+// default strategy's sleeping consumer stalls.
+func BenchmarkBusySpin(b *testing.B) {
+	spin := Options.WaitStrategy(BusySpinWaitStrategy{})
+	nop := []Handler{nopHandler{}}
+	b.Run("SP SC/R1", func(b *testing.B) { benchmarkDisruptorWith(b, reserve1, 1, nop, spin) })
+	b.Run("SP SC/R16", func(b *testing.B) { benchmarkDisruptorWith(b, reserve4, 1, nop, spin) })
+	b.Run("SP SC/R16/1K", func(b *testing.B) { benchmarkDisruptorWith(b, reserve4, 1, nop, spin, Options.BufferCapacity(1024)) })
+	b.Run("SP MC/R1", func(b *testing.B) {
+		benchmarkDisruptorWith(b, reserve1, 1, []Handler{nopHandler{}, nopHandler{}}, spin)
+	})
+	b.Run("Shared SP SC/R1", func(b *testing.B) { benchmarkDisruptorWith(b, reserve1, 1, nop, spin, Options.WriterCount(2)) })
+	b.Run("MP SC/R1", func(b *testing.B) { benchmarkDisruptorWith(b, reserve1, 4, nop, spin, Options.WriterCount(4)) })
+	b.Run("MP SC/R16", func(b *testing.B) { benchmarkDisruptorWith(b, reserve4, 4, nop, spin, Options.WriterCount(4)) })
 }
 
 type handledSequenceHandler struct{ handled atomic.Int64 }

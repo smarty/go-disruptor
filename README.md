@@ -127,6 +127,8 @@ Due to improvements in the [Go memory model](http://golang.org/ref/mem) as of ve
 
 Performance Tweaks:
 ---------
+**Wait strategy.** The default `WaitStrategy` sleeps when a consumer finds nothing to do, which makes each wake-up slow: about 2 µs typically, and up to a full millisecond once the Go runtime has parked its threads (sub-millisecond timers then wait in `epoll` with a 1 ms timeout). When latency matters more than CPU, use `disruptor.Options.WaitStrategy(disruptor.BusySpinWaitStrategy{})`: every waiting goroutine spins on its barrier with a CPU spin hint (`PAUSE`), waking within a few hundred nanoseconds at p99 whatever the idle period. Throughput under sustained load is close to the default's with a single writer but lower with multiple writers, whose shared counters a polling consumer contends for. The cost is a whole CPU per waiting goroutine (each listener, and each producer that can find the ring full), all the time, including while the application is idle. (The default is not free while idle either: its sub-microsecond sleeps keep the Go scheduler spinning, costing roughly half a core for an idle listener.) Give each one a dedicated core and set `GOMAXPROCS` high enough for everything else; a spinner that shares a CPU with the goroutine it waits for can stall for the runtime's ~10 ms preemption interval.
+
 To keep caches hot, each producer (where possible) and each consumer should have its goroutine pinned to a particular core via `runtime.LockOSThread()` and the underlying OS thread pinned to a particular CPU core using a CGo call to `sched_setaffinity`. 
 
 Caveats

@@ -317,6 +317,72 @@ has been empty for a gap; `latency-ns/op` is publish to handled) and `BenchmarkS
   triggers (e.g. a futex or channel signal on the transition from empty, which puts a cost on `Commit`).
 - The benchmarks were kept; the strategy was not. The original default is unchanged.
 
+## 6b. Opt-in busy-spin wait strategy and the empty-poll `Load`: adopted
+
+`BusySpinWaitStrategy` makes every wait one `spinHint()` (eight `PAUSE`s on amd64). Pilots, pinned, unreserved, turbo
+on, 6 shuffled rounds each:
+
+| Variant (busy-spin rows)             | SP SC/R1 | SP MC/R1 | SP SC/R16 | Shared SP SC/R1 | Wake p50  |
+|--------------------------------------|----------|----------|-----------|-----------------|-----------|
+| 1 `PAUSE`, `Load` reads upper first  | 5.20n    | 8.75n    | 0.342n    | 41.6n           | 150-176ns |
+| 1 `PAUSE`, empty-poll `Load`         | 5.27n    | 10.1n    | 0.337n    | 27.8n           | 161-220ns |
+| 8 `PAUSE`s, `Load` reads upper first | 3.85n    | 4.26n    | 0.242n    | 25.5n           | 190-404ns |
+| 8 `PAUSE`s, empty-poll `Load`        | 3.88n    | 4.27n    | 0.243n    | 11.5n           | 210-398ns |
+| No spin hint (vs 1 `PAUSE`)          | +78%     | ~        | +46%      | +31%            | ~         |
+
+- The spinning consumer's polls take the producer's cache lines away. More `PAUSE`s per poll cut that traffic, and
+  reading `reservedSequence` only when the first marker is current removes the shared sequencer's worst case (every
+  `Reserve` is a locked add on that line). The eight `PAUSE`s cost ~100-250ns of wake-up latency.
+
+Final design against the default strategy, same binary, P-cores reserved, turbo off, 10 shuffled rounds
+(`bench/suite baseline`, 2026-09-28):
+
+| Benchmark                   | Default     | Busy-spin | Delta   |
+|-----------------------------|-------------|-----------|---------|
+| Wake p50 (6 rows)           | 1.52-2.20us | 261-413ns | 4-8x    |
+| Wake p99, no gap or 2us gap | 9.0-22.5us  | 296-484ns | 19-76x  |
+| Wake p99, 50us gap          | 1.04ms      | 549-578ns | ~1,850x |
+| SP SC/R16 at 1K slots       | 8.95n       | 0.682n    | -92%    |
+| SP SC/R1                    | 4.73n       | 5.00n     | +6%     |
+| SP MC/R1                    | 4.79n       | 5.57n     | +16%    |
+| SP SC/R16 (64K)             | 0.297n      | 0.313n    | +5%     |
+| Shared SP SC/R1             | 9.86n       | 15.44n    | +57%    |
+| MP SC/R1                    | 35.9n       | 41.5n     | +16%    |
+| MP SC/R16                   | 2.40n       | 2.40n     | ~       |
+
+The empty-poll `Load` against the previous `Load`, default strategy, 8 rounds:
+
+| Benchmark            | Before | After  | Delta            |
+|----------------------|--------|--------|------------------|
+| Shared SP SC/R1      | 7.57n  | 7.93n  | +4.7% (p=0.010)  |
+| Shared SP SC/R1, 1K  | 15.88n | 11.43n | -28.0% (p=0.000) |
+| Shared SP SC/R1, 64K | 7.67n  | 7.82n  | +1.9% (p=0.002)  |
+| MP MC/R4             | 2.10n  | 1.90n  | -9.4% (p=0.003)  |
+| Other multi-producer | —      | —      | ~                |
+| Geomean              | 8.65n  | 8.27n  | -4.3%            |
+
+Reserved and turbo off (`bench/compare`, base `d9cd73b`, 10 rounds): shared SP SC/R1 +1.6% (9.70 to 9.86ns,
+p=0.000), MP MC/R1 -4.8%, MP MC/R4 -7.3%, other multi-producer rows unchanged, geomean -2.2%. The single-writer rows
+also got 5-9% faster (and `Sequencer/Commit` 2.3% slower) although their code did not change, so treat single-writer
+deltas of that size between two binaries as code-layout effects.
+
+CPU cost (`BenchmarkIdleCPU`: process CPU time over wall time while the ring is empty, or while one event arrives every
+100us; reserved, turbo off, medians of 10 rounds):
+
+| Consumers | Default, idle | Default, sparse | Busy-spin, idle | Busy-spin, sparse |
+|-----------|---------------|-----------------|-----------------|-------------------|
+| 1         | 0.55 cores    | 0.23 cores      | 1.00 cores      | 1.02 cores        |
+| 2         | 0.84 cores    | 0.78 cores      | 2.00 cores      | 2.01 cores        |
+
+- Busy-spin costs exactly one core per waiting goroutine, as designed.
+- **The default is not cheap while idle either.** A plain Go loop of `time.Sleep(500ns)` burns 0.57 cores (0.78 for two
+  goroutines), while `time.Sleep(50us)` or `time.Sleep(1ms)` costs 0.02: a sub-microsecond timer keeps the runtime's
+  scheduler threads spinning. So an idle default consumer spends more than half a core to buy a 1-2us median wake-up,
+  and its p99 after an idle gap is already ~1ms (section 6a). An idle phase that escalates to a longer sleep (tens of
+  microseconds) would cut idle CPU ~30x while barely moving that p99; not yet tried.
+
+Still to do: arm64 (`YIELD` may be far shorter than `PAUSE`), and Zen 2.
+
 ## 7. Tooling lessons
 
 - `go test -bench` splits its pattern on `/` per sub-benchmark level, except inside parentheses:
@@ -336,7 +402,7 @@ has been empty for a gap; `latency-ns/op` is publish to handled) and `BenchmarkS
 |---|-------------------------------------|--------------------------------------|----------|---------------|
 | 1 | Release-store `Commit` (amd64 stub) | Single writer -37-44%, ring -44%     | Small    | Done          |
 | 2 | Capacity / full-buffer slow path    | 1K 23x slower (R16); now required    | Low      | Done          |
-| 3 | Spinning `WaitStrategy` (opt-in)    | Phased default failed (section 6a)   | Moderate | Next          |
+| 3 | Spinning `WaitStrategy` (opt-in)    | p99 wake ~0.3-0.5us vs 10us-1ms      | Moderate | Done          |
 | 4 | Writer batch-boundary false sharing | MP SC/R4 15-18% faster, prefetch off | Low      | Counters next |
 | 5 | Multi-producer reserve-1            | `reservedSequence.Add` contention    | High     | Document only |
 | 6 | arm64 `LDAPR` barrier loads         | Store is already `STLR`; 3-5% old M5 | Small    | Measure first |
@@ -346,9 +412,9 @@ has been empty for a gap; `latency-ns/op` is publish to handled) and `BenchmarkS
 2. **Capacity and the slow path.** Done: the cost was the consumer's `Idle` sleep, not the producer's (section 5a), and
    `BufferCapacity` is now required, 64K recommended. The same data motivates pathway 3: a shorter consumer wake shrinks
    the capacity needed.
-3. **Spinning wait strategy.** A phased default failed on sparse traffic (section 6a), so spinning has to be opt-in:
-   busy-spin with `PAUSE` on dedicated cores, like Java's `BusySpinWaitStrategy`, judged with `BenchmarkWakeLatency`.
-   A producer-triggered wake-up on the empty-to-non-empty transition is the alternative for shared cores.
+3. **Spinning wait strategy.** Done (section 6b): opt-in `BusySpinWaitStrategy`, plus the empty-poll `Load`. Open: a
+   producer-triggered wake-up on the empty-to-non-empty transition, for low latency without a dedicated core, and an
+   escalating idle sleep for the default, whose 500ns sleeps cost 0.58 cores per idle consumer.
 4. **Batch-boundary false sharing.** Count store misses in RingBuffer MP SC/R4 with prefetchers on vs off, attributed to
    the writer's entry store; vary batch size and alignment. Likely user guidance rather than a library change.
 5. **Multi-producer reserve-1.** Per-writer chunked claims would let an unused claimed slot block every consumer. The
