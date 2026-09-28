@@ -20,6 +20,12 @@ func TestNew_NonPowerOfTwoCapacity(t *testing.T) {
 		t.Fatal("expected error for non-power-of-two capacity")
 	}
 }
+func TestNew_MissingCapacity(t *testing.T) {
+	_, err := New(Options.NewHandlerGroup(nopHandler{}))
+	if err == nil {
+		t.Fatal("expected error when no capacity is provided")
+	}
+}
 func TestNew_NoHandlers(t *testing.T) {
 	_, err := New(Options.BufferCapacity(1024))
 	if err == nil {

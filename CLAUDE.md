@@ -53,8 +53,8 @@ array) and indexes into it using `sequence & mask`.
   - `WaitStrategy`: `Gate(int64)`, `Idle(int64)`, `Reserve(int64)`
   - Error sentinels: `ErrReservationSize` (-1), `ErrCapacityUnavailable` (-2)
 - **`config.go`** — `New()` constructor returns `(Disruptor, error)`. Functional options via `Options` singleton.
-  Default capacity: 1024, default wait: `Gosched()` on gate / 500ns sleep on idle / 1ns sleep on reserve. Also contains
-  `defaultWaitStrategy` and `defaultDisruptor`.
+  `BufferCapacity` is required (no default since v0.5.0's 1024; 65536 recommended). Default wait: `Gosched()` on gate /
+  500ns sleep on idle / 1ns sleep on reserve. Also contains `defaultWaitStrategy` and `defaultDisruptor`.
 - **`sequence.go`** — `atomicSequence`: cache-line-padded `atomic.Int64`. Padding is `[CacheLineBytes - 8]byte` placed
   before the embedded `atomic.Int64` (one-sided padding — the next allocation's leading padding provides the trailing
   separation). `newSequences(count)` over-allocates one extra cache line as a single contiguous `[]byte` and starts the
@@ -171,6 +171,15 @@ goroutine placement across CCXs varies per run, so only large, replicated multi-
   barrier cannot help. Untested on Intel.
 - **Seq-cst stores are not free on x86.** A Go `atomic.Int64.Store` compiles to `XCHG` (a full barrier, ~19 cycles on
   Zen 2) and dominates single-writer throughput. Only seq-cst *loads* are plain `MOV`s on x86.
+- **Adopted — `BufferCapacity` required, 64K recommended (the default was 1024).** A ring must hold more events than
+  producers publish while a sleeping consumer wakes: `time.Sleep(500ns)` in `Idle` takes ~1.9us median and ~9us p99 on
+  the i7-12700K. At 1K slots a batching single writer (R16) was 23x slower than at 16K (7.9ns vs 0.34ns), with consumers
+  sleeping ~33,000 times per million events instead of ~20. Every shape plateaus by 64K; the shared sequencer at R1 is
+  still 19% faster at 64K than 16K, while 256K adds only 1-7% for 2MB of `committedSlots`. Single-writer R1 is
+  capacity-insensitive (the consumer is the slower side, so the ring stays full). Measured pinned but unreserved, turbo
+  on, 3 runs; the deltas dwarf the noise. Rather than raising the default, `New()` now requires the capacity: an
+  application that omitted it sized its own ring buffer at 1024, and a larger default would let writers silently
+  overwrite unconsumed entries. Failing fast in `New()` is the only safe way to change it.
 
 ### Conventions
 

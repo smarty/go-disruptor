@@ -12,7 +12,7 @@ func New(options ...option) (Disruptor, error) {
 	Options.apply(options...)(&config)
 
 	if config.BufferCapacity <= 0 {
-		return nil, errors.New("buffer capacity must be at least 1")
+		return nil, errors.New("a buffer capacity is required (a power of 2 matching the ring buffer's length, e.g. 65536)")
 	} else if config.BufferCapacity&(config.BufferCapacity-1) != 0 {
 		return nil, errors.New("the buffer capacity must be a power of two, e.g. 2, 4, 8, 16")
 	} else if len(config.HandlerGroups) == 0 {
@@ -57,7 +57,10 @@ func (this configuration) newListeners(committedBarrier sequenceBarrier) (listen
 	return newCompositeListener(listeners), handledBarrier
 }
 
-// BufferCapacity sets the number of slots in the ring buffer. Must be a power of 2. Default: 1024.
+// BufferCapacity sets the number of slots in the ring buffer: required, a power of 2, and exactly the length of the
+// application's own ring buffer. There is no default, because a mismatch lets writers overwrite unconsumed entries.
+// 65536 (64K) is recommended: it is the smallest capacity at which every benchmarked shape stops improving, while
+// smaller rings stall producers whenever a sleeping consumer wakes (1024 is up to 23x slower).
 func (singleton) BufferCapacity(value uint32) option {
 	return func(this *configuration) { this.BufferCapacity = value }
 }
@@ -116,7 +119,6 @@ func (singleton) apply(options ...option) option {
 }
 func (singleton) defaults(options ...option) []option {
 	return append([]option{
-		Options.BufferCapacity(1024),
 		Options.WriterCount(1),
 		Options.WaitStrategy(defaultWaitStrategy{}),
 	}, options...)
