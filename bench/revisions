@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Builds several git revisions and runs them against each other on reserved cores. Run as yourself, from anywhere in
+# the repository; the reserved run calls sudo once, after every binary is built.
+#
+# Usage:
+#   bench/revisions [--rounds N] [--output DIRECTORY] [CPU options] [NAME=REF]...
+#
+# Each NAME=REF is built from a temporary, detached worktree of REF (removed on exit). Without any, the default
+# variants trace the performance work of 2026-09-25 through 2026-09-28, one step at a time:
+#   prefriday=c6137a0    before any of it
+#   friday=4ca05e6       end of 2026-09-25, the last revision measured on the Threadripper 3970X (Zen 2)
+#   prerelease=c104c6e   the Intel-only changes of 2026-09-26 and 2026-09-27, just before the release store
+#   release=41f7bc0      release-store Commit
+#   head=HEAD            the empty-poll Load and BusySpinWaitStrategy
+# The first variant is benchstat's base. Benchmarks that a revision lacks (RingBuffer before d7f5a60) are simply
+# missing from its column. SharedSequencer/SP SC/R1 before f5a4e29 ran the single-writer sequencer, not the shared one.
+#
+# Options:
+#   --rounds N                    interleaved rounds (default 10)
+#   --output DIRECTORY            results directory (default /tmp/go-disruptor-bench/<UTC timestamp>-revisions)
+#   --cpus CPUS                   CPUs to reserve: both threads of every benchmark core
+#   --housekeeping CPUS           CPUs for everything else
+#   --single-producer-cpus CPUS   one thread per core, for GOMAXPROCS=4 sets
+#   --multi-producer-cpus CPUS    one thread per core, for GOMAXPROCS=8 sets
+#
+# The CPU options default to a known layout for the Threadripper 3970X (CCXs 0-1 and their SMT siblings; single
+# producer on one CCX, multi-producer across two) and the i7-12700K (P-cores only); any other CPU must pass all four.
+# Results go to <output>/{environment.txt,<name>.txt,benchstat.txt}.
+
+readonly _repository="$(cd "$(dirname "${0}")/.." && pwd)"
+readonly _default_variants=(prefriday=c6137a0 friday=4ca05e6 prerelease=c104c6e release=41f7bc0 head=HEAD)
+_rounds=10
+_output=""
+_cpus=""
+_housekeeping=""
+_single_producer_cpus=""
+_multi_producer_cpus=""
+_variants=()
+_worktrees=()
+
+_main() {
+	_parse_arguments "$@"
+	_apply_defaults
+	mkdir -p "${_output}/bin"
+	trap _remove_worktrees EXIT
+
+	local _variant
+	for _variant in "${_variants[@]}"; do
+		_build "${_variant%%=*}" "${_variant#*=}"
+	done
+	_remove_worktrees
+	_run
+	_log_info "Results are in [${_output}]; the comparison is [${_output}/benchstat.txt]."
+}
+
+_build() {
+	local _name="${1}" _reference="${2}" _commit _worktree
+	_commit="$(git -C "${_repository}" rev-parse --verify "${_reference}^{commit}")" ||
+		_fail "The revision [${_reference}] does not exist."
+	_worktree="${_output}/worktree-${_name}"
+	_log_info "Building [${_name}] from [${_reference}] (${_commit:0:12})..."
+	git -C "${_repository}" worktree add --quiet --detach "${_worktree}" "${_commit}"
+	_worktrees+=("${_worktree}")
+	(cd "${_worktree}" && go test -c -o "${_output}/bin/${_name}.test" .)
+}
+
+_run() {
+	local _benchstat _arguments=() _variant
+	_benchstat="$(_find_benchstat)"
+	for _variant in "${_variants[@]}"; do
+		_arguments+=("${_variant%%=*}=${_output}/bin/${_variant%%=*}.test")
+	done
+	_log_info "Running [${_rounds}] rounds of [${#_variants[@]}] variants on reserved CPUs [${_cpus}]..."
+	sudo "${_repository}/bench/reserve" --cpus "${_cpus}" --housekeeping "${_housekeeping}" -- \
+		"${_repository}/bench/interleave" --rounds "${_rounds}" --output "${_output}" --benchstat "${_benchstat}" \
+		--set "${_single_producer_cpus}:4:^BenchmarkSequencer\$/(SP|Commit)" \
+		--set "${_single_producer_cpus}:4:^Benchmark(SharedSequencer|RingBuffer)\$/SP" \
+		--set "${_multi_producer_cpus}:8:^Benchmark(SharedSequencer|RingBuffer)\$/MP" \
+		"${_arguments[@]}"
+}
+
+_remove_worktrees() {
+	local _worktree
+	for _worktree in "${_worktrees[@]}"; do
+		test -d "${_worktree}" || continue
+		git -C "${_repository}" worktree remove --force "${_worktree}" ||
+			_log_warn "Could not remove the worktree [${_worktree}]; run: git worktree prune"
+	done
+	_worktrees=()
+}
+
+_find_benchstat() {
+	local _path
+	_path="$(command -v benchstat || true)"
+	test -n "${_path}" || _path="$(go env GOPATH)/bin/benchstat"
+	test -x "${_path}" || _fail "benchstat not found; install it with: go install golang.org/x/perf/cmd/benchstat@latest"
+	echo "${_path}"
+}
+
+_parse_arguments() {
+	while test "$#" -gt 0; do
+		case "${1}" in
+		--rounds) _rounds="${2}"; shift 2 ;;
+		--output) _output="${2}"; shift 2 ;;
+		--cpus) _cpus="${2}"; shift 2 ;;
+		--housekeeping) _housekeeping="${2}"; shift 2 ;;
+		--single-producer-cpus) _single_producer_cpus="${2}"; shift 2 ;;
+		--multi-producer-cpus) _multi_producer_cpus="${2}"; shift 2 ;;
+		*=*) _variants+=("${1}"); shift ;;
+		*) _fail "Unknown argument [${1}]." ;;
+		esac
+	done
+}
+
+_apply_defaults() {
+	test "${#_variants[@]}" -gt 0 || _variants=("${_default_variants[@]}")
+	test -n "${_output}" || _output="/tmp/go-disruptor-bench/$(date -u '+%Y-%m-%d-%H%M%S')-revisions"
+	test -n "${_cpus}" && test -n "${_housekeeping}" && test -n "${_single_producer_cpus}" &&
+		test -n "${_multi_producer_cpus}" && return 0
+
+	local _model
+	_model="$(lscpu | sed -n 's/^Model name: *//p')"
+	case "${_model}" in
+	"AMD Ryzen Threadripper 3970X 32-Core Processor")
+		_apply_layout "0-7,32-39" "8-31,40-63" "0,1,2,3" "0,1,2,3,4,5,6,7" ;;
+	"12th Gen Intel(R) Core(TM) i7-12700K")
+		_apply_layout "0-15" "16-19" "0,2,4,6" "0,2,4,6,8,10,12,14" ;;
+	*)
+		_fail "No known CPU layout for [${_model}]; pass every CPU option." ;;
+	esac
+}
+
+# Fills in only the CPU options that were not passed.
+_apply_layout() {
+	_cpus="${_cpus:-${1}}"
+	_housekeeping="${_housekeeping:-${2}}"
+	_single_producer_cpus="${_single_producer_cpus:-${3}}"
+	_multi_producer_cpus="${_multi_producer_cpus:-${4}}"
+}
+
+_fail() { _log_error "${1}"; exit 1; }
+
+_log_info()  { _log "[INFO] ${1}"; }
+_log_warn()  { _log "[WARN] ${1}"; }
+_log_error() { _log "[ERROR] ${1}"; }
+_log()       { echo "$(date -u '+%Y-%m-%d %H:%M:%SZ') ${1}" >&2; }
+
+_main "$@"

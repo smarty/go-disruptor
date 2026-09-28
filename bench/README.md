@@ -9,6 +9,7 @@ variants in shuffled order across rounds, and compare with `benchstat`
 |---------------------------|---------|--------------------------------------------------------------------------------|
 | `suite`                   | you     | Builds, then runs the validate, baseline, and prefetch steps via `reserve`     |
 | `compare`                 | you     | A git revision (default `HEAD`) against the working tree, via `reserve`        |
+| `revisions`               | you     | Several git revisions against each other, via `reserve`; knows the 3970X too   |
 | `reserve`                 | root    | Moves everything else off the benchmark CPUs, disables turbo, restores on exit |
 | `interleave`              | either  | Shuffled rounds per variant, then `environment.txt` and `benchstat`            |
 | `msr-prefetch`            | root    | Reads/writes Intel's prefetcher MSR (`0x1a4`), with the Golden Cove bit map    |
