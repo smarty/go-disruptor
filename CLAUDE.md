@@ -19,11 +19,11 @@ runs them. Both run every test twice, with and without `-race`, because non-race
 store (see `store_release_*`) that race builds never compile.
 
 `bench/` holds the tooling behind the Performance Findings: `suite` (builds and runs the standard reserved suite),
-`reserve` (reserves cores and disables turbo, as root), `interleave` (shuffled rounds of prebuilt test binaries, then
-`benchstat`), `msr-prefetch` (Intel prefetcher controls, with the measured Golden Cove bit map), and `bench/prefetch`
-(the `PairChase` positive control for prefetcher experiments). `bench/README.md` documents the method, including `perf`
-event choices and why attribution must use precise (`:pp`) sampling. Performance claims should come from that method,
-with `environment.txt` kept alongside.
+`compare` (a git revision against the working tree, reserved), `reserve` (reserves cores and disables turbo, as root),
+`interleave` (shuffled rounds of prebuilt test binaries, then `benchstat`), `msr-prefetch` (Intel prefetcher controls,
+with the measured Golden Cove bit map), and `bench/prefetch` (the `PairChase` positive control for prefetcher
+experiments). `bench/README.md` documents the method, including `perf` event choices and why attribution must use
+precise (`:pp`) sampling. Performance claims should come from that method, with `environment.txt` kept alongside.
 
 ## Architecture
 

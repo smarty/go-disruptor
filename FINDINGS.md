@@ -214,7 +214,7 @@ single-producer, 8 multi-producer), unreserved, turbo on, 3 runs, medians in ns/
   default instead was rejected: an application that omitted the option sized its own ring buffer at 1024, and writers
   would silently overwrite its unconsumed entries. `New()` now fails fast instead.
 
-## 6. Release stores in `Commit`: the largest measured opportunity
+## 6. Release stores in `Commit`: adopted
 
 Go compiles `atomic.Int64.Store` to `XCHG` on amd64: locked, so it cannot retire until the core owns the line, which the
 consumer usually still holds. A release store is a plain `MOV` on x86 (TSO), which retires into the store buffer while
@@ -237,7 +237,7 @@ Single-producer variance also fell from ±7-25% to ±3-6%, suggesting much of th
 the Go scheduler (untested). The unsafe variant is an upper bound, not shippable: it is a data race under the Go memory
 model, and it is safe only while `Commit` is not inlined.
 
-How to ship it (full analysis in `TODO.md`, "Release stores for `Commit` via an amd64 assembly stub"):
+How the options compared (the design notes now live with `store_release_*` in `CLAUDE.md`):
 
 - **Viable:** a one-instruction amd64 assembly stub called from both `Commit` methods in a file built with
   `//go:build amd64 && !race`, with `atomic.Store` everywhere else. The build-tag split is required: the race detector
@@ -252,6 +252,70 @@ How to ship it (full analysis in `TODO.md`, "Release stores for `Commit` via an 
   which a library cannot impose.
 - **Unavailable: `sync/atomic` release/acquire.** Go 1.27's `atomic.Int64` has only `Add`, `And`, `CompareAndSwap`,
   `Load`, `Or`, `Store`, and `Swap`.
+
+**Shipped:** `storeRelease` (`store_release_amd64.s`, a `MOVQ`, behind `amd64 && !race`; `atomic.Store` elsewhere). The
+compiler calls the ABI0 function directly, with no wrapper: the cost is a small frame, the stack check, and restoring
+`X15`/`R14` after the call. Forcing the stub into a `-race` build produced 10,987 false data-race reports in
+`TestEndToEnd`, confirming the tag split. Pinned, unreserved, turbo on, 10 shuffled rounds:
+
+| Benchmark           | Base (`XCHG`) | Stub (`MOVQ` call) | Plain (inline) | Stub delta | Plain delta |
+|---------------------|---------------|--------------------|----------------|------------|-------------|
+| Sequencer/Commit    | 3.49n ±0%     | 0.823n ±0%         | 0.242n ±34%    | -76.4%     | -93.1%      |
+| SP SC               | 5.32n ±25%    | 3.66n ±2%          | 3.17n ±3%      | -31.2%     | -40.4%      |
+| SP4SC               | 0.335n ±39%   | 0.232n ±4%         | 0.201n ±6%     | -30.7%     | -40.0%      |
+| SP MC               | 5.39n ±6%     | 3.70n ±1%          | 3.17n ±2%      | -31.4%     | -41.2%      |
+| SP4MC               | 0.338n ±2%    | 0.240n ±2%         | 0.203n ±2%     | -28.8%     | -39.8%      |
+| Shared SP SC/R1     | 10.49n ±2%    | 7.56n ±1%          | 6.99n ±7%      | -28.0%     | -33.4%      |
+| RingBuffer SP SC/R1 | 8.27n ±1%     | 4.07n ±1%          | 3.52n ±2%      | -50.8%     | -57.5%      |
+| RingBuffer SP SC/R4 | 1.52n ±2%     | 1.46n ±1%          | 1.47n ±2%      | -3.8%      | -3.1%       |
+| Multi-producer rows | —             | —                  | —              | ~ to -4%   | ~ to -5%    |
+
+The stub keeps about three quarters of the upper bound, and single-producer variance collapses (±6-39% to ±1-4%).
+
+Confirmed on reserved P-cores with turbo off (`bench/compare`, base `c104c6e`, 10 shuffled rounds, 2026-09-28):
+
+| Benchmark               | Base (`XCHG`) | Stub        | Delta          |
+|-------------------------|---------------|-------------|----------------|
+| Sequencer/Commit        | 4.741n ±0%    | 1.115n ±0%  | -76.5%         |
+| SP SC                   | 8.929n ±35%   | 5.000n ±0%  | -44.0%         |
+| SP4SC                   | 0.5295n ±17%  | 0.3157n ±1% | -40.4%         |
+| SP MC                   | 8.064n ±10%   | 5.042n ±0%  | -37.5%         |
+| SP4MC                   | 0.5308n ±10%  | 0.4088n ±9% | -23.0%         |
+| Shared SP SC/R1         | 14.205n ±1%   | 9.694n ±0%  | -31.8%         |
+| RingBuffer SP SC/R1     | 10.455n ±0%   | 5.861n ±2%  | -44.0%         |
+| RingBuffer SP SC/R4     | 2.059n ±2%    | 1.972n ±0%  | -4.3%          |
+| Multi-producer (6 rows) | —             | —           | -2.3% to -4.6% |
+| Geomean                 | 5.747n        | 4.168n      | -27.5%         |
+
+Reserved and turbo off, the gains are larger than in the pilot, and even the multi-producer rows improve slightly (all
+p <= 0.005). Still to do: Zen 2.
+
+## 6a. Phased-backoff default wait strategy: not adopted
+
+Tried: `Idle` and `Reserve` spin (return immediately) for the first N calls of a wait, then `Gosched` for 16 calls,
+then sleep as before. New benchmarks measure it directly: `BenchmarkWakeLatency` (one event published after the ring
+has been empty for a gap; `latency-ns/op` is publish to handled) and `BenchmarkSequencerCapacity` (single writer, 1K to
+64K slots). Pilot, pinned, turbo on:
+
+| Measure                              | Original (sleep first) | Spin 256, yield 16 |
+|--------------------------------------|------------------------|--------------------|
+| SP SC/R16 at 1K slots                | 7.05n                  | 0.57n              |
+| Wake latency, no gap (mean)          | 5.8us                  | 0.15us             |
+| Wake latency, 2us gap (p50 / p99)    | 1.6us / 69us           | 0.25us / 950us     |
+| Wake latency, 50us gap (p50 / p90)   | 1.1us / 559us          | 648us / 1.04ms     |
+| Wake latency, 50us gap (mean)        | ~100us                 | ~550us             |
+
+- Dense traffic wins big: the consumer is still spinning when the next event arrives, and small rings stop stalling.
+- Sparse traffic loses badly. All three variants measured after a gap (spin 256 with 16 yields, spin 256 with no
+  yields, and 16 yields with no spins) made mean latency 2-8x worse at a 2us gap and ~5x worse at 50us.
+- The mechanism is the Go runtime, not the Disruptor. A `time.Sleep` shorter than 1ms is fast only while some thread
+  is still spinning in the scheduler; once the thread parks, `netpoll_epoll.go` rounds the epoll timeout up to 1ms
+  (`delay < 1e6` gives `waitms = 1`). Both strategies show the 1ms tail; after a spin phase, far more wakes land in it,
+  plausibly because the runtime's other threads have parked by the time the consumer finally sleeps (not verified).
+- Consequence: no sleep-based `Idle` phase can promise sub-millisecond wake latency in Go. Low latency after idle needs
+  a consumer that never sleeps (an opt-in spinning strategy on a dedicated core, pathway 3) or a wake-up the producer
+  triggers (e.g. a futex or channel signal on the transition from empty, which puts a cost on `Commit`).
+- The benchmarks were kept; the strategy was not. The original default is unchanged.
 
 ## 7. Tooling lessons
 
@@ -270,25 +334,28 @@ How to ship it (full analysis in `TODO.md`, "Release stores for `Commit` via an 
 
 | # | Pathway                             | Evidence                             | Cost     | Status        |
 |---|-------------------------------------|--------------------------------------|----------|---------------|
-| 1 | Release-store `Commit` (amd64 stub) | Upper bound -44-49% single writer    | Small    | Next          |
+| 1 | Release-store `Commit` (amd64 stub) | Single writer -37-44%, ring -44%     | Small    | Done          |
 | 2 | Capacity / full-buffer slow path    | 1K 23x slower (R16); now required    | Low      | Done          |
-| 3 | Spinning `WaitStrategy` (opt-in)    | Nothing measured yet                 | Moderate | After 2       |
+| 3 | Spinning `WaitStrategy` (opt-in)    | Phased default failed (section 6a)   | Moderate | Next          |
 | 4 | Writer batch-boundary false sharing | MP SC/R4 15-18% faster, prefetch off | Low      | Counters next |
 | 5 | Multi-producer reserve-1            | `reservedSequence.Add` contention    | High     | Document only |
-| 6 | arm64 release store (`STLR` stub)   | Prototype: 3-5% on Apple M5          | Small    | After 1       |
+| 6 | arm64 `LDAPR` barrier loads         | Store is already `STLR`; 3-5% old M5 | Small    | Measure first |
 
-1. **Release-store `Commit`.** Implement the stub, then interleave base vs stub vs the unsafe plain store to see how
-   much of the upper bound survives the call.
+1. **Release-store `Commit`.** Done (section 6), confirmed on reserved cores: single writer 37-44% faster. Zen 2 is
+   untested.
 2. **Capacity and the slow path.** Done: the cost was the consumer's `Idle` sleep, not the producer's (section 5a), and
    `BufferCapacity` is now required, 64K recommended. The same data motivates pathway 3: a shorter consumer wake shrinks
    the capacity needed.
-3. **Spinning wait strategy.** Busy-spin with `PAUSE` on dedicated cores, like Java's `BusySpinWaitStrategy`; measure
-   throughput and tail latency (the benchmarks measure only throughput today).
+3. **Spinning wait strategy.** A phased default failed on sparse traffic (section 6a), so spinning has to be opt-in:
+   busy-spin with `PAUSE` on dedicated cores, like Java's `BusySpinWaitStrategy`, judged with `BenchmarkWakeLatency`.
+   A producer-triggered wake-up on the empty-to-non-empty transition is the alternative for shared cores.
 4. **Batch-boundary false sharing.** Count store misses in RingBuffer MP SC/R4 with prefetchers on vs off, attributed to
    the writer's entry store; vary batch size and alignment. Likely user guidance rather than a library change.
 5. **Multi-producer reserve-1.** Per-writer chunked claims would let an unused claimed slot block every consumer. The
    practical lever is batching (R4 is ~10x faster); document it.
-6. **arm64.** Same stub pattern with `STLR`; testable on the macOS laptop.
+6. **arm64.** No release-store gain is available: Go already compiles `atomic.Int64.Store` to `STLR` and `Load` to
+   `LDAR`. The remaining idea is `LDAPR` (RCpc) for barrier loads, which can complete ahead of the same core's earlier
+   `STLR`; measure on the macOS laptop before building it.
 
 Ruled out with evidence: 128B padding, concrete dispatch, the unbounded `Load` scan, software `PREFETCHW` in `Commit`
 (the release store addresses the same stall directly), and `go:linkname`.

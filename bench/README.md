@@ -8,6 +8,7 @@ variants in shuffled order across rounds, and compare with `benchstat`
 | Tool                      | Runs as | Purpose                                                                        |
 |---------------------------|---------|--------------------------------------------------------------------------------|
 | `suite`                   | you     | Builds, then runs the validate, baseline, and prefetch steps via `reserve`     |
+| `compare`                 | you     | A git revision (default `HEAD`) against the working tree, via `reserve`        |
 | `reserve`                 | root    | Moves everything else off the benchmark CPUs, disables turbo, restores on exit |
 | `interleave`              | either  | Shuffled rounds per variant, then `environment.txt` and `benchstat`            |
 | `msr-prefetch`            | root    | Reads/writes Intel's prefetcher MSR (`0x1a4`), with the Golden Cove bit map    |
@@ -17,14 +18,18 @@ variants in shuffled order across rounds, and compare with `benchstat`
 
 `bench/suite` (run as yourself; it calls `sudo` per step) builds the binaries and runs three steps, writing to
 `/tmp/go-disruptor-bench/<UTC timestamp>/<step>/`: `validate` (one round, asserting that reservation works and that
-switching the prefetchers off slows `PairChase` by at least 1.3x), `baseline` (10 rounds of the capacity sweep and
-ring-buffer benchmarks), and `prefetch` (the same benchmarks, prefetchers on vs off, with the control). Run one step
-with `bench/suite baseline`. The CPU layout defaults to the i7-12700K; any other CPU must pass every CPU option.
+switching the prefetchers off slows `PairChase` by at least 1.3x), `baseline` (10 rounds of the capacity sweeps,
+ring-buffer, and wake-latency benchmarks), and `prefetch` (the same benchmarks, prefetchers on vs off, with the
+control). Run one step with `bench/suite baseline`. The CPU layout defaults to the i7-12700K; any other CPU must pass
+every CPU option.
 
 Note that `-test.bench` splits its pattern on `/` per sub-benchmark level, except inside parentheses: select two
-benchmark families with `(SharedSequencerCapacity|RingBuffer)/SP`, not `SharedSequencerCapacity/SP|RingBuffer/SP`.
+benchmark families with `(SequencerCapacity|RingBuffer)/SP`, not `SequencerCapacity/SP|RingBuffer/SP`.
 
 ## Comparing two variants
+
+`bench/compare` does all of the following for the common case: it builds `--base` (default `HEAD`) in a temporary
+worktree and the working tree as the candidate, then runs the core sets for 10 reserved rounds.
 
 ```bash
 go test -c -o /tmp/base.test .                                # build every variant first; nothing compiles mid-run

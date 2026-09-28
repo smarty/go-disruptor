@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Compares a git revision (default HEAD) against the working tree on reserved cores. Run as yourself, from anywhere in
+# the repository; the reserved run calls sudo once.
+#
+# Usage:
+#   bench/compare [--base REF] [--rounds N] [--output DIRECTORY]
+#
+# The base is built from a temporary, detached worktree of REF (removed on exit), and the candidate from the working
+# tree as it is, including uncommitted changes. Both run the core benchmark sets, interleaved in shuffled order, and
+# benchstat compares them. Results go to <output>/{environment.txt,base.txt,candidate.txt,benchstat.txt}.
+#
+# Options:
+#   --base REF          revision to compare against (default HEAD)
+#   --rounds N          interleaved rounds (default 10; ~75 seconds each)
+#   --output DIRECTORY  results directory (default /tmp/go-disruptor-bench/<UTC timestamp>-compare)
+#
+# The CPU layout is the i7-12700K's (see bench/README.md, "Choosing CPUs"); other CPUs need these values changed.
+
+readonly _default_cpu_model="12th Gen Intel(R) Core(TM) i7-12700K"
+readonly _cpus="0-15"
+readonly _housekeeping="16-19"
+readonly _single_producer_cpus="0,2,4,6"
+readonly _multi_producer_cpus="0,2,4,6,8,10,12,14"
+readonly _repository="$(cd "$(dirname "${0}")/.." && pwd)"
+_base="HEAD"
+_rounds=10
+_output=""
+_worktree=""
+
+_main() {
+	_parse_arguments "$@"
+	_assert_cpu_model
+	test -n "${_output}" || _output="/tmp/go-disruptor-bench/$(date -u '+%Y-%m-%d-%H%M%S')-compare"
+	mkdir -p "${_output}/bin"
+	trap _remove_worktree EXIT
+
+	_build_base
+	_build_candidate
+	_run
+	_log_info "Results are in [${_output}]; the comparison is [${_output}/benchstat.txt]."
+}
+
+_build_base() {
+	local _commit
+	_commit="$(git -C "${_repository}" rev-parse --verify "${_base}^{commit}")" ||
+		_fail "The base revision [${_base}] does not exist."
+	_worktree="${_output}/base-worktree"
+	_log_info "Building the base [${_base}] (${_commit:0:12}) from a temporary worktree..."
+	git -C "${_repository}" worktree add --quiet --detach "${_worktree}" "${_commit}"
+	(cd "${_worktree}" && go test -c -o "${_output}/bin/base.test" .)
+}
+
+_build_candidate() {
+	_log_info "Building the candidate from the working tree..."
+	git -C "${_repository}" status --short | sed 's/^/    /' >&2
+	(cd "${_repository}" && go test -c -o "${_output}/bin/candidate.test" .)
+}
+
+_run() {
+	local _benchstat
+	_benchstat="$(_find_benchstat)"
+	_log_info "Running [${_rounds}] rounds on reserved CPUs [${_cpus}]..."
+	sudo "${_repository}/bench/reserve" --cpus "${_cpus}" --housekeeping "${_housekeeping}" -- \
+		"${_repository}/bench/interleave" --rounds "${_rounds}" --output "${_output}" --benchstat "${_benchstat}" \
+		--set "${_single_producer_cpus}:4:^BenchmarkSequencer\$/(SP|Commit)" \
+		--set "${_single_producer_cpus}:4:^Benchmark(SharedSequencer|RingBuffer)\$/SP" \
+		--set "${_multi_producer_cpus}:8:^Benchmark(SharedSequencer|RingBuffer)\$/MP" \
+		base="${_output}/bin/base.test" candidate="${_output}/bin/candidate.test"
+}
+
+_remove_worktree() {
+	test -n "${_worktree}" && test -d "${_worktree}" || return 0
+	git -C "${_repository}" worktree remove --force "${_worktree}" ||
+		_log_warn "Could not remove the worktree [${_worktree}]; run: git worktree prune"
+}
+
+_find_benchstat() {
+	local _path
+	_path="$(command -v benchstat || true)"
+	test -n "${_path}" || _path="$(go env GOPATH)/bin/benchstat"
+	test -x "${_path}" || _fail "benchstat not found; install it with: go install golang.org/x/perf/cmd/benchstat@latest"
+	echo "${_path}"
+}
+
+_assert_cpu_model() {
+	local _model
+	_model="$(lscpu | sed -n 's/^Model name: *//p')"
+	test "${_model}" = "${_default_cpu_model}" ||
+		_fail "The CPU layout is for [${_default_cpu_model}], not [${_model}]; edit the CPU values at the top."
+}
+
+_parse_arguments() {
+	while test "$#" -gt 0; do
+		case "${1}" in
+		--base) _base="${2}"; shift 2 ;;
+		--rounds) _rounds="${2}"; shift 2 ;;
+		--output) _output="${2}"; shift 2 ;;
+		*) _fail "Unknown argument [${1}]." ;;
+		esac
+	done
+}
+
+_fail() { _log_error "${1}"; exit 1; }
+
+_log_info()  { _log "[INFO] ${1}"; }
+_log_warn()  { _log "[WARN] ${1}"; }
+_log_error() { _log "[ERROR] ${1}"; }
+_log()       { echo "$(date -u '+%Y-%m-%d %H:%M:%SZ') ${1}" >&2; }
+
+_main "$@"

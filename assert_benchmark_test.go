@@ -3,6 +3,7 @@ package disruptor
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -168,6 +169,62 @@ func BenchmarkSharedSequencerCapacity(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkSequencerCapacity sweeps the single writer's ring capacity. The single writer allocates nothing per slot,
+// so capacity matters only through how often the producer waits for a sleeping consumer: at 1K slots, reserving 16 at
+// a time was 23x slower than at 16K with the original wait strategy.
+func BenchmarkSequencerCapacity(b *testing.B) {
+	for _, capacity := range []uint32{1 << 10, 1 << 12, 1 << 14, 1 << 16} {
+		name := fmt.Sprintf("%dK", capacity>>10)
+		b.Run("SP SC/R1/"+name, func(b *testing.B) {
+			benchmarkDisruptorWith(b, reserve1, 1, []Handler{nopHandler{}}, Options.BufferCapacity(capacity))
+		})
+		b.Run("SP SC/R16/"+name, func(b *testing.B) {
+			benchmarkDisruptorWith(b, reserve4, 1, []Handler{nopHandler{}}, Options.BufferCapacity(capacity))
+		})
+	}
+}
+
+// BenchmarkWakeLatency measures how long a consumer takes to handle a single event published after the ring has been
+// empty for a given gap, which is what the WaitStrategy's Idle phases determine. The producer busy-waits through the
+// gap and for the event to be handled, so the reported latency-ns/op is the consumer's alone (plus ~20ns of clock
+// reads); ns/op includes the gap.
+func BenchmarkWakeLatency(b *testing.B) {
+	for _, gap := range []time.Duration{0, 2 * time.Microsecond, 50 * time.Microsecond} {
+		b.Run(fmt.Sprintf("SP SC/%v", gap), func(b *testing.B) { benchmarkWakeLatency(b, gap, 1) })
+		b.Run(fmt.Sprintf("Shared SP SC/%v", gap), func(b *testing.B) { benchmarkWakeLatency(b, gap, 2) })
+	}
+}
+func benchmarkWakeLatency(b *testing.B, gap time.Duration, writerCount uint8) {
+	handler := &handledSequenceHandler{}
+	handler.handled.Store(defaultSequenceValue)
+	disruptor, _ := New(Options.BufferCapacity(ringBufferSize), Options.WriterCount(writerCount), Options.NewHandlerGroup(handler))
+	defer disruptor.Listen()
+
+	go func() {
+		defer func() { _ = disruptor.Close() }()
+		time.Sleep(time.Millisecond * 100) // let the Listen goroutine have time to start
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		var latency time.Duration
+		for i := 0; i < b.N; i++ {
+			for idleSince := time.Now(); time.Since(idleSince) < gap; {
+			}
+			published := time.Now()
+			sequence := disruptor.Reserve(1)
+			disruptor.Commit(sequence, sequence)
+			for handler.handled.Load() < sequence {
+			}
+			latency += time.Since(published)
+		}
+		b.ReportMetric(float64(latency.Nanoseconds())/float64(b.N), "latency-ns/op")
+	}()
+}
+
+type handledSequenceHandler struct{ handled atomic.Int64 }
+
+func (this *handledSequenceHandler) Handle(_, upper int64) { this.handled.Store(upper) }
 
 // BenchmarkRingBuffer adds the application's side of the traffic that the other benchmarks omit: writers store into a
 // ring buffer of 64B entries (4MB at 64K slots) before committing, and the handler reads every entry it is given.
