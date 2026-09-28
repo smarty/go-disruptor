@@ -158,6 +158,38 @@ Both scripts currently hard-code the i7-12700K's CPU layout: `bench/suite` accep
 `bench/compare` needs them added first. Multi-producer rows there are ±10-25% across CCXs, so only large, replicated
 deltas count.
 
+### TODO: Pin benchmark producers and consumers to chosen cores
+
+`bench/interleave` pins each benchmark set to a CPU list with `taskset`, but inside that list the Go scheduler decides
+which CPU runs each producer and consumer, and the choice changes from run to run. On the Threadripper this likely
+accounts for most of the multi-producer spread (±10-25%): whether a writer and the consumer share a CCX changes the
+cost of every cache-line transfer. It also blocks the most direct test of the Zen 2 release-store regression (an
+unreserved pilot on 2026-09-28 had `c104c6e` → `41f7bc0` making `Sequencer/SP SC` 19% slower on one CCX and ~40%
+slower across CCXs, while `Commit` alone got 65% faster): same CCX versus the next CCX, on purpose.
+
+The likely shape:
+
+- Producers are the benchmark's own goroutines (`benchmarkDisruptorWith`), so each pins itself before its loop:
+  `runtime.LockOSThread()`, then `sched_setaffinity` on its own thread via `syscall.RawSyscall` (Linux only, behind a
+  build tag with a no-op elsewhere; no `golang.org/x/sys`, to keep the module dependency-free).
+- Consumers run on goroutines the library owns (the benchmark goroutine for a single handler, `compositeListener`'s
+  goroutines for several), so the handler pins itself on its first `Handle` call. No library API change.
+- Opt-in, for example `DISRUPTOR_BENCH_PIN='producers=0,1,2,3;consumers=4,5'`. Unset, every benchmark behaves exactly
+  as today, so existing rows stay comparable with earlier runs.
+- Fail the benchmark on a pinning error rather than silently running unpinned. `sched_setaffinity` returns `EINVAL`
+  for a CPU outside the set's `taskset` mask.
+
+The caveat to measure, not assume: a locked goroutine can only run on its own thread, so the default strategy's
+`Gosched()` (`Gate`) and `time.Sleep` (`Idle`) must hand it back to that exact thread (`startlockedm`, a futex wake)
+instead of letting any idle thread pick it up. Pinned default-strategy rows may therefore measure a configuration
+applications do not run. `BusySpinWaitStrategy` never yields, so pinning it reflects the hardware faithfully.
+
+Done when: (1) the pinned layout is selectable per `--set` (or per variant) in `bench/interleave`; (2) a pinned run
+of `c104c6e` against `41f7bc0`, busy-spin and default, with the consumer on the producer's CCX and then on the next CCX,
+says whether the Zen 2 regression is an intra-CCX or an Infinity Fabric effect; (3) repeating the multi-producer rows
+pinned shows whether their spread narrows enough to trust smaller deltas; and (4) the default-strategy cost of pinning
+is measured once (pinned against unpinned, same CPUs) and recorded in `FINDINGS.md`.
+
 ## Research questions
 
 ### FUTURE: Open questions from the Intel investigation
