@@ -36,53 +36,15 @@ forgets to check the return value will use -1 or -2 as a sequence number, silent
 `(-1 & mask)` or `(-2 & mask)`—corrupting data with no signal. Java throws `InsufficientCapacityException`. The current
 API makes misuse easy and silent.
 
-### Release stores for `Commit` via an amd64 assembly stub
+### arm64: no release-store gain; consider `LDAPR` for barrier loads (FUTURE)
 
-`Commit` is the only Commit→Load ordering edge in each sequencer (`committedSequence` for the single producer,
-`committedSlots` for the shared producer), and that edge only requires release/acquire. Both currently use
-`atomic.Int64.Store`, which Go compiles to `XCHG` on x86: a locked instruction that cannot retire until the core owns
-the cache line, which the consumer usually still holds. A release store is a plain `MOV` on x86 (TSO), which retires
-into the store buffer while ownership is acquired in the background. Seq-cst *loads* are already plain `MOV`s on x86, so
-only the store side needs to change.
-
-**Measured upper bound** (i7-12700K, 2026-09-27, unreserved pilot, 10 shuffled rounds): an unsafe variant that replaces
-both `Commit` stores with plain stores through `unsafe.Pointer` made single-writer rows 44-49% faster (`SP SC` 5.87 →
-3.04 ns), shared `SP SC/R1` 33% faster, and `MP SC/R1` 5% faster; the other multi-producer rows did not move (they are
-bound by contention on `reservedSequence.Add`). Single-producer variance also fell from ±7-25% to ±3-6%, suggesting
-much of that noise came from `XCHG` stalls rather than the Go scheduler (untested). This agrees with `perf` on Zen 2,
-where `Commit`'s `XCHG` was 51-58% of single-writer cycles. On Apple M5 (ARM64), the earlier `load-acquire` prototype
-measured only ~3-5%. That prototype (branch `load-acquire`, commit `bc78c07`) predates the one-marker-per-batch
-shared sequencer and used 32-bit operations.
-
-**The remaining viable design:** a one-instruction amd64 assembly function (`TEXT ·storeRelease(SB)`, a `MOVQ`) in
-this package, called from both `Commit` methods in a file built with `//go:build amd64 && !race`. Every other build,
-including all `-race` builds, keeps `atomic.Int64.Store`. The build-tag split is what keeps the race detector working:
-
-- The race detector models synchronization only through instrumented `sync/atomic` calls. Assembly is not
-  instrumented, so an unconditional stub would erase the Commit→Load happens-before edge, and `go test -race` would
-  report false positives on every legitimate ring-buffer read and write. The `load-acquire` branch hit exactly this.
-- Under the split, race builds keep the real release/acquire edge, so genuine races in user code are still caught, and
-  both paths implement the same contract (release on commit).
-- The compiler treats a call into assembly as opaque, so earlier stores (the caller's ring-buffer writes) cannot move
-  past it, and it cannot be inlined.
-- The stub adds one call per commit. That cost has not been measured; there is about 2.8 ns of headroom on `SP SC`.
-
-`make test` runs only with `-race`, so it would never exercise the stub. The Makefile needs a non-race pass as well
-(e.g., `go test -short ./...` and `TestEndToEnd` without `-race`). Verify the split by running `TestEndToEnd` under
-`-race` with and without the build tag: false positives should appear only without it. arm64 would need its own `STLR`
-stub, which the M5 result suggests is worth much less.
-
-**Rejected alternatives:**
-
-- **`go:linkname` into `internal/runtime/atomic`** (the `load-acquire` branch). The Go 1.27 linker rejects it outright:
-  `link: main: invalid reference to internal/runtime/atomic.StoreRel64`. It links only with
-  `-ldflags=-checklinkname=0`, which a library cannot impose on the programs that import it.
-- **A plain Go store behind `amd64 && !race`.** It costs nothing and does not affect race builds, but it is a data race
-  under the Go memory model. It is safe only while `Commit` is never inlined. Profile-guided optimization can
-  devirtualize the hot `Sequencer` interface call and inline it, and the compiler could then legally move the caller's
-  ring-buffer writes past the store. That would fail only in a user's PGO build, never in our tests.
-- **First-class release/acquire in `sync/atomic`.** Still not available as of Go 1.27: `atomic.Int64` offers only
-  `Add`, `And`, `CompareAndSwap`, `Load`, `Or`, `Store`, and `Swap`.
+amd64 now commits with `storeRelease`, a one-instruction assembly `MOVQ` behind `//go:build amd64 && !race` (37-44%
+faster single writer; see `FINDINGS.md` section 6). arm64 needs no equivalent: Go already compiles `atomic.Int64.Store`
+to `STLR` (a release store) and `Load` to `LDAR` (`internal/runtime/atomic/atomic_arm64.s`). The one remaining lever is
+the load side: `LDAR` is RCsc, so it cannot complete ahead of the same core's earlier `STLR`, while `LDAPR` (ARMv8.3,
+RCpc, present on Apple M-series) can. That matters only where one goroutine both commits and loads (for example, a
+producer reading the consumer barrier right after a commit). The older `load-acquire` prototype measured ~3-5% on
+Apple M5, but it predates the batch markers and its source of gain was never isolated. Measure before adding a stub.
 
 ### Compared to Java LMAX—missing features
 

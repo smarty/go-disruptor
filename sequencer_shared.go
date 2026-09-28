@@ -137,7 +137,7 @@ func (this *sharedSequencer) Commit(lower, upper int64) {
 		return // an empty range would overwrite (and hide) the marker of a batch already committed at lower
 	}
 
-	this.committedSlots[lower&(int64(this.capacity)-1)].Store(upper) // see notes above for committedSlots field
+	storeRelease(&this.committedSlots[lower&(int64(this.capacity)-1)], upper) // see notes above for committedSlots field
 }
 
 func (this *sharedSequencer) Load(lower int64) int64 {

@@ -17,9 +17,9 @@ package disruptor
 //     consumerBarrier field during the slow-path spin loop.
 //
 //   - committedSequence: a synchronized sequence value which indicates to downstream consumers how far the producer
-//     has committed. The value is updated when Commit is called via a single atomic operation. This atomic
-//     operation acts as the appropriate memory fence which guarantees that changes to the contents of the underlying
-//     ring buffer are visible to downstream consumers.
+//     has committed. The value is updated when Commit is called via a single release store (storeRelease), which
+//     guarantees that changes to the contents of the underlying ring buffer are visible to downstream consumers
+//     before the new sequence is.
 //
 //   - consumerBarrier: a barrier or group of sequences used to determine the slowest sequence position across all
 //     downstream consumers. The value is only read during the slow-path spin loop when the producer has detected
@@ -90,4 +90,6 @@ func (this *defaultSequencer) TryReserve(count uint32) int64 {
 
 	return this.reservedSequence
 }
-func (this *defaultSequencer) Commit(_, upper int64) { this.committedSequence.Store(upper) }
+func (this *defaultSequencer) Commit(_, upper int64) {
+	storeRelease(&this.committedSequence.Int64, upper)
+}

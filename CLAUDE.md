@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 make build          # run tests then compile
-make test           # go test -timeout=1s -short -race -covermode=atomic ./...
-make test.long      # go test -run TestEndToEnd -timeout=120s -race -covermode=atomic -v ./...
+make test           # go test -timeout=1s -short -race -covermode=atomic ./..., then again without -race
+make test.long      # go test -run TestEndToEnd -timeout=120s -race -covermode=atomic -v ./..., then without -race
 make benchmark      # go test -bench=. -benchmem
 make compile        # go build ./...
 go run ./example    # run the example
@@ -15,7 +15,8 @@ go run ./example    # run the example
 
 Benchmarks live in `assert_benchmark_test.go`. Unit tests live in `assert_unit_test.go`. Long-running integration tests
 live in `assert_integration_test.go` and are guarded by `testing.Short()` — `make test` skips them, `make test.long`
-runs them. The test command runs with race detection enabled.
+runs them. Both run every test twice, with and without `-race`, because non-race amd64 builds use the assembly release
+store (see `store_release_*`) that race builds never compile.
 
 `bench/` holds the tooling behind the Performance Findings: `suite` (builds and runs the standard reserved suite),
 `reserve` (reserves cores and disables turbo, as root), `interleave` (shuffled rounds of prebuilt test binaries, then
@@ -67,7 +68,13 @@ array) and indexes into it using `sequence & mask`.
   - `cpu_padding_64bit.go` — 64B for `386`, `amd64`, `arm64` (non-Darwin), `loong64`, `riscv64`, `wasm`
   - `cpu_padding_128bit.go` — 128B for `arm64` (Darwin), `ppc64`, `ppc64le`
   - `cpu_padding_256bit.go` — 256B for `s390x`
-- **`sequencer.go`** — Single-writer sequencer (64B, one cache line). Uses atomic Store for commit. Spins with
+- **`store_release_amd64.s`/`store_release_amd64.go`/`store_release_atomic.go`** — `storeRelease(*atomic.Int64,
+  int64)`, the commit store for both sequencers. On amd64 without `-race` it is a one-instruction assembly `MOVQ` (a
+  release store under TSO, where `atomic.Int64.Store` is an `XCHG`); everywhere else, including every `-race` build, it
+  is `atomic.Int64.Store`. The race detector sees only instrumented `sync/atomic` calls, so the stub must stay behind
+  `!race` (forcing it into a race build produces thousands of false data-race reports in `TestEndToEnd`). Never
+  replace it with a plain Go store: PGO can inline `Commit` and the compiler may then move ring-buffer writes past it.
+- **`sequencer.go`** — Single-writer sequencer (64B, one cache line). Commits with `storeRelease`. Spins with
   `WaitStrategy.Reserve()` when waiting for consumers to advance. `TryReserve` is non-blocking: single barrier check,
   returns `ErrCapacityUnavailable` if no room.
 - **`sequencer_shared.go`** — Multi-writer sequencer (128B, two cache lines). Uses atomic Add for `Reserve` (not CAS —
@@ -173,6 +180,13 @@ goroutine placement across CCXs varies per run, so only large, replicated multi-
   barrier cannot help. Untested on Intel.
 - **Seq-cst stores are not free on x86.** A Go `atomic.Int64.Store` compiles to `XCHG` (a full barrier, ~19 cycles on
   Zen 2) and dominates single-writer throughput. Only seq-cst *loads* are plain `MOV`s on x86.
+- **Adopted — release-store `Commit` on amd64** (`storeRelease`, an assembly `MOVQ` behind `amd64 && !race`). On the
+  i7-12700K (P-cores reserved, turbo off, 10 shuffled rounds, `bench/compare`): single writer 37-44% faster (`SP SC`
+  8.93 → 5.00ns, `SP MC` 8.06 → 5.04ns), `SP4MC` 23%, ring buffer with data `SP SC/R1` 44% faster (10.46 → 5.86ns),
+  shared sequencer with one writer 32% faster, and every multi-producer row 2-5% faster (all p=0.000-0.005). Base
+  single-producer variance of ±10-35% fell to ±0-2%. In an unreserved pilot, an unsafe inline plain store (the upper
+  bound) beat the stub by only another ~10 points, so the non-inlinable call keeps about three quarters of the gain.
+  Untested on Zen 2.
 - **Adopted — `BufferCapacity` required, 64K recommended (the default was 1024).** A ring must hold more events than
   producers publish while a sleeping consumer wakes: `time.Sleep(500ns)` in `Idle` takes ~1.9us median and ~9us p99 on
   the i7-12700K. At 1K slots a batching single writer (R16) was 23x slower than at 16K (7.9ns vs 0.34ns), with consumers
