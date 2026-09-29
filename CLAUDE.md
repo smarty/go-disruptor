@@ -224,6 +224,39 @@ goroutine placement across CCXs varies per run, so only large, replicated multi-
   application that omitted it sized its own ring buffer at 1024, and a larger default would let writers silently
   overwrite unconsumed entries. Failing fast in `New()` is the only safe way to change it.
 
+### TODO: Confirm the Zen 2 commit-store fix on Intel, and settle the empty-poll `Load`
+
+Status on 2026-09-28. Reserved runs on the Threadripper 3970X (boost off, CCXs 0-1 reserved, 10 shuffled rounds) found
+that two changes adopted from Intel-only measurements regress on Zen 2:
+
+- **The assembly release-store stub** (`41f7bc0`) made the single writer 18-19% slower than `XCHG` (replicated). The
+  cost is the ABI0 call (18 instructions, 6 loads, and 4 stores per event), not the store: an inlined plain store is
+  12-14% *faster* than `XCHG`. In the shared sequencer, the release store made multi-producer rows 13-28% slower
+  whether called or inlined, so there it is the store's semantics. Branch `zen2-commit-store` (`07f3670`) fixes both:
+  a plain store inlined into a `//go:noinline` single-writer `Commit`, and `XCHG` again for the shared sequencer.
+  Reserved on Zen 2, against `master`: single writer 26% faster, multi-producer R16 rows 9-17% faster.
+- **The empty-poll `Load`** (`039e083`) made `MP MC/R1` 21% and `MP SC/R4` 20% slower on Zen 2 (one run), while on
+  Intel it made them 4.8-7.3% faster and made busy-spin with one shared writer much faster. Branch `zen2-nopoll`
+  (`9fa0397`) is `zen2-commit-store` with only that `Load` reverted, for measurement.
+
+Also found: the batch markers (`72d4fbc`) cost multi-producer R1 12-17% on Zen 2 (three runs) while making R16 20-34%
+faster, so "reserve-1 is unchanged" in the batch-marker finding holds only for Intel. Multi-producer R1 on Zen 2 is
+very layout-sensitive (`b70c130` and `385ca0b` moved it +38% and then -27%), so trust only replicated deltas there.
+
+What to do: run, on both the i7-12700K and the Threadripper,
+
+```bash
+git fetch && bench/revisions master=origin/master fix=origin/zen2-commit-store nopoll=origin/zen2-nopoll
+```
+
+Done when: (1) Intel shows `fix` no slower than `master` on single-writer rows (the stub's upper-bound pilot predicts a
+little faster) and at most the expected 2-5% on multi-producer rows; (2) the Zen 2 run replicates `fix` against
+`master` and `nopoll` against `fix`; (3) the empty-poll `Load` is decided (keep, revert, or a variant that keeps the
+early return but orders the loads differently when not empty); (4) `zen2-commit-store` is merged; and (5) the
+Performance Findings above are corrected (the release-store and empty-poll findings, "Untested on Zen 2", and the
+batch-marker reserve-1 claim), with the details in `FINDINGS.md` and the "Confirm on Zen 2" item in `TODO.md` closed.
+Raw results so far are under `/tmp/go-disruptor-bench/2026-09-28-*` on the Threadripper (host-local; not preserved).
+
 ### Conventions
 
 - Refer to `example/main.go` and the README for current API usage.
