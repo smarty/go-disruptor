@@ -62,8 +62,13 @@ array) and indexes into it using `sequence & mask`.
   slower. Needs a dedicated CPU per waiting goroutine.
 - **`wait_strategy_park.go`** — `ParkingWaitStrategy` (exported, opt-in): idle and gated listeners spin, yield, then park
   on a per-disruptor `parker`. `New` wraps the sequencer in `notifyingSequencer` (only for this strategy), so `Commit`,
-  each handled batch, and `Close` call `parker.notify`, whose `waiters.Add(0)` (a `LOCK XADD`) is the Dekker fence.
-  Never replace it with `waiters.Load()`.
+  each handled batch, and `Close` wake parked listeners. `notify` is a plain `waiters.Load()`; Dekker's pattern needs
+  each caller's store ordered before that load. Listener callers (after `handledSequence.Store`, and `running.Store`
+  in `Close`) call `notify` directly, because those are seq-cst `sync/atomic` stores. `Commit` publishes with
+  `storeRelease`, so it must call `notifyAfterRelease`, which runs `fullFence` first: `LOCK ORQ $0, 0(SP)` on amd64
+  without `-race` (where `storeRelease` is a plain `MOVQ`), a no-op elsewhere. Never call `notify` after a
+  `storeRelease`, and never make `notify` a read-modify-write on `waiters` (it cost ~43ns per Commit: a shared line).
+  `fullFence` lives in `store_release_*` and follows the same `!race` rule.
 - **`sequence.go`** — `atomicSequence`: cache-line-padded `atomic.Int64`. Padding is `[CacheLineBytes - 8]byte` placed
   before the embedded `atomic.Int64` (one-sided padding — the next allocation's leading padding provides the trailing
   separation). `newSequences(count)` over-allocates one extra cache line as a single contiguous `[]byte` and starts the
@@ -231,8 +236,10 @@ path is not exercised on arm64, so the fence cost on amd64 is unmeasured; the re
 - Wake latency after a 2us or 50us gap is worse than the default: p50 8.6-14.1us against 2.2us, p99 19.7-24.5us
   against 13.4-13.6us. Not met. With no gap it is 84-125ns p50. A park-to-wake trip is the cost; it allocates one
   channel per notify that finds a waiter.
-- `Commit` pays one `LOCK XADD`. The `BenchmarkParking` rows are 49-457% slower than `BenchmarkBusySpin`, mixing that
-  fence with park churn. Use Parking for idle or sparse traffic only.
+- `notify` first ran `waiters.Add(0)`, which cost a near-constant ~43ns per Commit (a contended RMW on the shared
+  `waiters` line; every `BenchmarkParking` row is 0 B/op, so it was not park churn). With `waiters.Load()` (plus
+  `fullFence` on amd64), `BenchmarkParking` is 19-78% faster (`SP SC/R1` 66.1 to 21.5ns) and the wake-latency rows
+  do not move. The amd64 fence is unmeasured. Use Parking for idle or sparse traffic only.
 - The default-strategy rows did not move against master (all `~`, throughput geomean +0.26%).
 
 ### Conventions

@@ -410,30 +410,34 @@ sparse rows (one event per 100us) are the weakest: 13x for two consumers.
 **Criterion 2, wake p50 and p99 after long gaps no worse than the default: not met.** `BenchmarkWakeLatency`,
 medians of 10 rounds (p99 has ±15-86% spread on the Parking rows):
 
-| Gap  | Writers | Default p50 | Parking p50 | BusySpin p50 | Default p99 | Parking p99 | BusySpin p99 |
-|------|---------|-------------|-------------|--------------|-------------|-------------|--------------|
-| 0    | 1       | 3.42us      | 84ns        | n/a          | 14.04us     | 292ns       | 271ns        |
-| 0    | 2       | 3.46us      | 125ns       | n/a          | 14.04us     | 416ns       | 417ns        |
-| 2us  | 1       | 2.25us      | 8.63us      | n/a          | 13.42us     | 19.7us      | 333ns        |
-| 2us  | 2       | 2.23us      | 8.63us      | n/a          | 13.58us     | 19.9us      | 500ns        |
-| 50us | 1       | 2.15us      | 14.1us      | n/a          | 13.40us     | 24.5us      | 417ns        |
-| 50us | 2       | 2.21us      | 14.1us      | n/a          | 13.58us     | 23.2us      | 563ns        |
+| Gap  | Sequencer    | Default p50 | Parking p50 | BusySpin p50 | Default p99 | Parking p99 | BusySpin p99 |
+|------|--------------|-------------|-------------|--------------|-------------|-------------|--------------|
+| 0    | SP SC        | 3.42us      | 84ns        | 84ns         | 14.04us     | 292ns       | 271ns        |
+| 0    | Shared SP SC | 3.46us      | 125ns       | 125ns        | 14.04us     | 416ns       | 417ns        |
+| 2us  | SP SC        | 2.25us      | 8.63us      | 84ns         | 13.42us     | 19.7us      | 333ns        |
+| 2us  | Shared SP SC | 2.23us      | 8.63us      | 125ns        | 13.58us     | 19.9us      | 500ns        |
+| 50us | SP SC        | 2.15us      | 14.1us      | 84ns         | 13.40us     | 24.5us      | 417ns        |
+| 50us | Shared SP SC | 2.21us      | 14.1us      | 125ns        | 13.58us     | 23.2us      | 563ns        |
 
-- With no gap, Parking is the best of the three on p50 (97% lower than the default) and equal to BusySpin at p99,
-  because the Listener is still in its spin phase.
+`SP SC` is the single-writer sequencer; `Shared SP SC` is one writer on the shared sequencer (`WriterCount(2)`).
+
+- With no gap, Parking ties BusySpin on p50 (84ns and 125ns, 97% lower than the default) and equals it at p99,
+  because the Listener is still in its spin phase. BusySpin keeps that p50 at every gap.
 - After a 2us or 50us gap, the Listener has parked. A park-to-wake round trip through the Go scheduler costs 8-14us
   at p50 and 20-25us at p99. That is 4-7x the default's p50 and 1.5-1.8x its p99. These rows fail the criterion.
-- The default strategy's p99 here is 13-14us, not the 1ms seen on the i7 (section 6a). The Go runtime on macOS does not
-  show the epoll 1ms timer floor, so the default looks better here than on Linux. The Linux comparison could reverse
-  the p99 verdict. It cannot fix the p50 verdict unless the Linux wake is 4x faster, which no run has shown.
+- The default strategy's p99 here is 13-14us, not the 1ms seen on the i7 (section 6a). A likely explanation, not
+  verified: darwin's netpoll uses `kqueue`, which takes a nanosecond `timespec`, so the 1ms `epoll` timeout floor may
+  not apply on macOS. If so, the default looks better here than on Linux. The Linux comparison could reverse the p99
+  verdict. It cannot fix the p50 verdict unless the Linux wake is 4x faster, which no run has shown.
 - The strategy is not tuned. A longer spin phase would move the gap at which parking starts, not the cost of a park.
-- The parked path allocates: 108-112 B/op and 1 alloc/op on the 2us and 50us rows (one new channel per notify that
-  finds a waiter). The sparse idle rows show 7-15 allocs per millisecond for the same reason.
+- The parked path allocates. The 2us rows are 109 B/op with 0 allocs/op; only the 50us rows reach 1 alloc/op
+  (112 B/op). The cause is one new channel per notify that finds a waiter. The sparse idle rows show 8 (one consumer)
+  and 17 (two consumers) allocs/op, one op being a millisecond, for the same reason.
 
-**Criterion 3, the cost on `Commit`: measured.** `notify` runs `waiters.Add(0)`, a `LOCK XADD` (arm64: a seq-cst
-atomic), after every Commit and every handled batch. A notify that finds a waiter takes a mutex, closes a channel,
-makes a new one, and wakes every parked Listener. In the throughput families, run with the same binary,
-BusySpin against Parking (benchstat, 10 runs):
+**Criterion 3, the cost on `Commit`: measured.** As first built, `notify` ran `waiters.Add(0)`, a `LOCK XADD` (arm64:
+a seq-cst atomic read-modify-write), after every Commit and every handled batch. A notify that finds a waiter takes a
+mutex, closes a channel, makes a new one, and wakes every parked Listener. In the throughput families, run with the
+same binary, BusySpin against Parking (benchstat, 10 runs):
 
 | Row             | BusySpin | Parking | Delta |
 |-----------------|----------|---------|-------|
@@ -445,9 +449,46 @@ BusySpin against Parking (benchstat, 10 runs):
 | MP SC/R1        | 42.48n   | 63.12n  | +49%  |
 | MP SC/R16       | 2.241n   | 3.870n  | +73%  |
 
-These rows mix the fence with park and wake churn: a fast producer outruns the Listener, which then parks and needs a
-channel wake. So they bound the fence cost from above and do not isolate it. Parking is a strategy for idle and sparse
-traffic, not for throughput.
+The cost was not park and wake churn. Every `BenchmarkParking` row is 0 B/op, so no notify found a waiter (a wake
+allocates a channel). The extra time is near-constant per Commit: about 43ns at R1 (59.0 - 16.0), and the same at
+R16, where 2.7ns per slot times 16 slots is 43ns. That is the read-modify-write on the `waiters` line, which every
+Commit and every handled batch wrote, so the line moved between the producer's and the Listener's cores each time.
+
+**The fix: a load, and a private-line fence only where it is needed.** `notify` now runs `waiters.Load()`. Dekker's
+pattern still holds, because each side orders its store before its load:
+
+- The parking side adds itself to `waiters` with a seq-cst add, then re-reads the barrier.
+- A Listener calls `notify` after `handledSequence.Store` or (in Close) `running.Store`. Both are seq-cst `sync/atomic`
+  stores, so the load cannot move ahead of them.
+- `Commit` calls `notifyAfterRelease`, which runs `fullFence` and then `notify`. Where `storeRelease` is
+  `atomic.Int64.Store` (every build except amd64 without `-race`), `fullFence` is a no-op. On amd64 without `-race`,
+  `storeRelease` is a plain `MOVQ`, which x86 may reorder after a later load, so `fullFence` is `LOCK ORQ $0, 0(SP)`:
+  a locked instruction on the goroutine's own stack line (the Linux `smp_mb` idiom), not on a shared line.
+
+Base (`457d20d`, `waiters.Add(0)`) against the fix, same pilot machine, 10 interleaved rounds in shuffled order, only
+the `BenchmarkParking` family and the Parking rows of `BenchmarkWakeLatency` (raw results and `benchstat.txt` in
+`/tmp/go-disruptor-bench/parking-fence/`):
+
+| Row             | Add(0)  | Load   | Delta                 |
+|-----------------|---------|--------|-----------------------|
+| SP SC/R1        | 66.08n  | 21.50n | -67.5% (p=0.000)      |
+| SP SC/R16       | 3.997n  | 1.340n | -66.5% (p=0.000)      |
+| SP SC/R16/1K    | 3.905n  | 1.425n | -63.5% (p=0.000)      |
+| SP MC/R1        | 102.80n | 22.40n | -78.2% (p=0.000)      |
+| Shared SP SC/R1 | 72.80n  | 26.21n | -64.0% (p=0.000)      |
+| MP SC/R1        | 71.79n  | 58.28n | -18.8% (p=0.005)      |
+| MP SC/R16       | 4.177n  | 2.635n | -36.9% (p=0.007)      |
+
+- The single-writer rows save 44.6ns per Commit at R1 and 42.7ns per Commit at R16 (2.66ns per slot): the ~43ns
+  RMW cost, removed. `SP MC/R1` saves 80ns, because two Listeners each wrote the line per batch.
+- `SP SC/R1` is now 21.5ns, against BusySpin's 16.0ns in the earlier pass (a different run, so only a rough gap).
+- The four-writer rows gain less: their `Reserve` already contends on a shared counter.
+- The wake-latency rows did not move (all `~` except `Shared SP SC/50us` mean and p50, -10.6% and -2.3% at
+  p=0.043 and p=0.008), and their allocation is unchanged (109-112 B/op, 0 or 1 alloc/op).
+- The amd64 `fullFence` is compiled (`GOARCH=amd64 go vet` and `go test -c` pass, and `objdump` shows
+  `LOCK ORQ $0x0, 0(SP)`) but unmeasured: arm64 runs the no-op. The reserved i7 run must measure it.
+
+Parking is still a strategy for idle and sparse traffic, not for the lowest latency.
 
 **Criterion 4, no default-strategy row regresses: met.** Base (master) against candidate, 10 interleaved rounds, all
 default-strategy rows: 34 throughput rows (`Sequencer`, `SharedSequencer`, `SequencerCapacity`,
