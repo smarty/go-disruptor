@@ -1,9 +1,11 @@
 package disruptor
 
 import (
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestEndToEnd_SingleWriter(t *testing.T) {
@@ -143,3 +145,67 @@ const (
 	endToEndMultiplier    = 1 << endToEndHandlerGroups
 	endToEndWriterCount   = 2
 )
+
+// Four writers commit random batches with random idle gaps, so listeners park and wake at every gap length; every
+// handler must see every sequence exactly once, in order. The long Timeout means only a notify can wake a listener.
+func TestEndToEnd_ParkingRandomGaps(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end test")
+	}
+	const capacity, writers, totalSequences = 1024, 4, 200_000
+	var ring [capacity]atomic.Int64
+	handlers := []*orderingHandler{{ring: ring[:]}, {ring: ring[:]}, {ring: ring[:]}, {ring: ring[:]}}
+	subject, err := New(
+		Options.BufferCapacity(capacity),
+		Options.WriterCount(writers),
+		Options.WaitStrategy(ParkingWaitStrategy{Timeout: 10 * time.Second}),
+		Options.NewHandlerGroup(handlers[0], handlers[1]),
+		Options.NewHandlerGroup(handlers[2], handlers[3]))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gaps := []time.Duration{0, 10 * time.Microsecond, time.Millisecond, 5 * time.Millisecond}
+	var remaining atomic.Int64
+	remaining.Store(totalSequences)
+	var finished sync.WaitGroup
+	finished.Add(writers)
+	for writer := 0; writer < writers; writer++ {
+		go func() {
+			defer finished.Done()
+			random := rand.New(rand.NewPCG(uint64(writer), 2))
+			for {
+				size := int64(1 + random.IntN(16))
+				if remaining.Add(-size) < 0 {
+					return
+				}
+				upper := subject.Reserve(uint32(size))
+				for sequence := upper - size + 1; sequence <= upper; sequence++ {
+					ring[sequence&(capacity-1)].Store(sequence)
+				}
+				subject.Commit(upper-size+1, upper)
+				if gap := gaps[random.IntN(len(gaps))]; gap > 0 {
+					time.Sleep(gap)
+				}
+			}
+		}()
+	}
+	go func() { finished.Wait(); _ = subject.Close() }()
+
+	done := make(chan struct{})
+	go func() { subject.Listen(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the run did not end within 60s")
+	}
+
+	for index, handler := range handlers {
+		if handler.failure != "" {
+			t.Fatalf("handler %d: %s", index, handler.failure)
+		}
+		if handler.handled < totalSequences-writers*16 {
+			t.Fatalf("handler %d: handled only %d sequences", index, handler.handled)
+		}
+	}
+}

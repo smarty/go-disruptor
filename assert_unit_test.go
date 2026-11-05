@@ -299,6 +299,9 @@ func TestSharedLoad_RejectsMarkerStaleForManyLaps(t *testing.T) {
 // Concurrent writers reserving random batch sizes across many laps of a small ring buffer, through a two-group
 // pipeline; every handler must observe every sequence exactly once, in order, with the value the writer stored.
 func TestShared_RandomBatchesAcrossLaps(t *testing.T) { testRandomBatchesAcrossLaps(t, 4, 200_000) }
+func TestParking_RandomBatchesAcrossLaps(t *testing.T) {
+	testRandomBatchesAcrossLaps(t, 4, 200_000, Options.WaitStrategy(ParkingWaitStrategy{}))
+}
 func TestBusySpin_RandomBatchesAcrossLaps(t *testing.T) {
 	// Every writer and handler spins without yielding, so each needs a processor of its own (see BusySpinWaitStrategy).
 	// 50,000 sequences still lap the 64-slot ring ~780 times, and keep the -race pass well inside make test's timeout.

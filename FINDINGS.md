@@ -383,6 +383,81 @@ CPU cost (`BenchmarkIdleCPU`: process CPU time over wall time while the ring is 
 
 Still to do: arm64 (`YIELD` may be far shorter than `PAUSE`), and Zen 2.
 
+## 6c. `ParkingWaitStrategy`: idle CPU met, wake latency after a gap not met (pilot)
+
+`ParkingWaitStrategy` spins, then yields, then parks an idle Listener on a channel that every Commit, every handled
+batch, and Close wake (`wait_strategy_park.go`). Success criteria came from `TODO.md`.
+
+**Machine and method.** Every number in this section is: pilot: macOS, Apple M4 Pro, arm64, unreserved, turbo not
+controlled. `bench/reserve` and `bench/suite` need Linux and root, so neither ran. Instead, `go test -c` built master
+(`ef0337c`, from a temporary worktree) and the candidate (`0a65656` plus the Task 2 tests) as separate binaries. Ten
+rounds ran them in alternating order, base first in odd rounds, without CPU pinning, with
+`-benchmem -test.count 1`. `benchstat` compared them. The `BusySpin` and `Parking` throughput families ran in a
+second pass, 10 candidate-only runs, because the first pass pattern `^BusySpin$` matched nothing. Raw results are in
+`/tmp/go-disruptor-bench/parking-pilot/`. The i7-12700K reserved run is still open (`TODO.md`). Amd64's `storeRelease`
+(a plain `MOVQ`) path does not run on arm64, so the fence cost on amd64 is unmeasured here.
+
+**Criterion 1, idle CPU at least 10x lower than the default: met.** `BenchmarkIdleCPU`, median cores of 10 rounds:
+
+| Consumers | Default idle | Parking idle | Default sparse | Parking sparse | BusySpin idle / sparse |
+|-----------|--------------|--------------|----------------|----------------|------------------------|
+| 1         | 1.337        | 0.023 (57x)  | 1.361          | 0.085 (16x)    | 0.998 / 1.062          |
+| 2         | 1.618        | 0.035 (46x)  | 1.615          | 0.123 (13x)    | 1.998 / 2.063          |
+
+The default strategy costs more than a core on this machine (0.55 and 0.84 on the reserved i7, section 6b). The
+sparse rows (one event per 100us) are the weakest: 13x for two consumers.
+
+**Criterion 2, wake p50 and p99 after long gaps no worse than the default: not met.** `BenchmarkWakeLatency`,
+medians of 10 rounds (p99 has ±15-86% spread on the Parking rows):
+
+| Gap  | Writers | Default p50 | Parking p50 | BusySpin p50 | Default p99 | Parking p99 | BusySpin p99 |
+|------|---------|-------------|-------------|--------------|-------------|-------------|--------------|
+| 0    | 1       | 3.42us      | 84ns        | n/a          | 14.04us     | 292ns       | 271ns        |
+| 0    | 2       | 3.46us      | 125ns       | n/a          | 14.04us     | 416ns       | 417ns        |
+| 2us  | 1       | 2.25us      | 8.63us      | n/a          | 13.42us     | 19.7us      | 333ns        |
+| 2us  | 2       | 2.23us      | 8.63us      | n/a          | 13.58us     | 19.9us      | 500ns        |
+| 50us | 1       | 2.15us      | 14.1us      | n/a          | 13.40us     | 24.5us      | 417ns        |
+| 50us | 2       | 2.21us      | 14.1us      | n/a          | 13.58us     | 23.2us      | 563ns        |
+
+- With no gap, Parking is the best of the three on p50 (97% lower than the default) and equal to BusySpin at p99,
+  because the Listener is still in its spin phase.
+- After a 2us or 50us gap, the Listener has parked. A park-to-wake round trip through the Go scheduler costs 8-14us
+  at p50 and 20-25us at p99. That is 4-7x the default's p50 and 1.5-1.8x its p99. These rows fail the criterion.
+- The default strategy's p99 here is 13-14us, not the 1ms seen on the i7 (section 6a). The Go runtime on macOS does not
+  show the epoll 1ms timer floor, so the default looks better here than on Linux. The Linux comparison could reverse
+  the p99 verdict. It cannot fix the p50 verdict unless the Linux wake is 4x faster, which no run has shown.
+- The strategy is not tuned. A longer spin phase would move the gap at which parking starts, not the cost of a park.
+- The parked path allocates: 108-112 B/op and 1 alloc/op on the 2us and 50us rows (one new channel per notify that
+  finds a waiter). The sparse idle rows show 7-15 allocs per millisecond for the same reason.
+
+**Criterion 3, the cost on `Commit`: measured.** `notify` runs `waiters.Add(0)`, a `LOCK XADD` (arm64: a seq-cst
+atomic), after every Commit and every handled batch. A notify that finds a waiter takes a mutex, closes a channel,
+makes a new one, and wakes every parked Listener. In the throughput families, run with the same binary,
+BusySpin against Parking (benchstat, 10 runs):
+
+| Row             | BusySpin | Parking | Delta |
+|-----------------|----------|---------|-------|
+| SP SC/R1        | 15.98n   | 59.03n  | +270% |
+| SP SC/R16       | 1.003n   | 3.704n  | +269% |
+| SP SC/R16/1K    | 1.013n   | 3.832n  | +278% |
+| SP MC/R1        | 16.35n   | 91.11n  | +457% |
+| Shared SP SC/R1 | 22.19n   | 58.77n  | +165% |
+| MP SC/R1        | 42.48n   | 63.12n  | +49%  |
+| MP SC/R16       | 2.241n   | 3.870n  | +73%  |
+
+These rows mix the fence with park and wake churn: a fast producer outruns the Listener, which then parks and needs a
+channel wake. So they bound the fence cost from above and do not isolate it. Parking is a strategy for idle and sparse
+traffic, not for throughput.
+
+**Criterion 4, no default-strategy row regresses: met.** Base (master) against candidate, 10 interleaved rounds, all
+default-strategy rows: 34 throughput rows (`Sequencer`, `SharedSequencer`, `SequencerCapacity`,
+`SharedSequencerCapacity`, `RingBuffer`) and the `WakeLatency/Default` and `IdleCPU/Default` rows. Every row is `~`
+by benchstat (p>0.05) except `WakeLatency/SP_SC/2us` p50, -0.9% (p=0.045, an improvement). The throughput geomean
+moved +0.26%, from 10.17n to 10.20n. `New` wraps the Sequencer only for the Parking strategy, so the default path does
+not change.
+
+Open: the reserved i7-12700K run (`TODO.md`).
+
 ## 7. Tooling lessons
 
 - `go test -bench` splits its pattern on `/` per sub-benchmark level, except inside parentheses:

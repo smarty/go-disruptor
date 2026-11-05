@@ -60,6 +60,10 @@ array) and indexes into it using `sequence & mask`.
   `spinHint()`, eight `PAUSE`s on amd64 (eight `YIELD`s on arm64, unmeasured; a no-op elsewhere). Eight, not one: a
   single `PAUSE` let the polling consumer steal the producer's lines often enough to make the single writer ~40%
   slower. Needs a dedicated CPU per waiting goroutine.
+- **`wait_strategy_park.go`** — `ParkingWaitStrategy` (exported, opt-in): idle and gated listeners spin, yield, then park
+  on a per-disruptor `parker`. `New` wraps the sequencer in `notifyingSequencer` (only for this strategy), so `Commit`,
+  each handled batch, and `Close` call `parker.notify`, whose `waiters.Add(0)` (a `LOCK XADD`) is the Dekker fence.
+  Never replace it with `waiters.Load()`.
 - **`sequence.go`** — `atomicSequence`: cache-line-padded `atomic.Int64`. Padding is `[CacheLineBytes - 8]byte` placed
   before the embedded `atomic.Int64` (one-sided padding — the next allocation's leading padding provides the trailing
   separation). `newSequences(count)` over-allocates one extra cache line as a single contiguous `[]byte` and starts the
@@ -217,6 +221,19 @@ goroutine placement across CCXs varies per run, so only large, replicated multi-
   on, 3 runs; the deltas dwarf the noise. Rather than raising the default, `New()` now requires the capacity: an
   application that omitted it sized its own ring buffer at 1024, and a larger default would let writers silently
   overwrite unconsumed entries. Failing fast in `New()` is the only safe way to change it.
+
+**ParkingWaitStrategy (FINDINGS.md section 6c)**
+
+All numbers: pilot: macOS, Apple M4 Pro, arm64, unreserved, turbo not controlled. Amd64's plain-`MOVQ` `storeRelease`
+path is not exercised on arm64, so the fence cost on amd64 is unmeasured; the reserved i7 run is a TODO.
+
+- Idle CPU is 13-57x lower than the default (0.023-0.123 cores, against 1.34-1.62). Met.
+- Wake latency after a 2us or 50us gap is worse than the default: p50 8.6-14.1us against 2.2us, p99 19.7-24.5us
+  against 13.4-13.6us. Not met. With no gap it is 84-125ns p50. A park-to-wake trip is the cost; it allocates one
+  channel per notify that finds a waiter.
+- `Commit` pays one `LOCK XADD`. The `BenchmarkParking` rows are 49-457% slower than `BenchmarkBusySpin`, mixing that
+  fence with park churn. Use Parking for idle or sparse traffic only.
+- The default-strategy rows did not move against master (all `~`, throughput geomean +0.26%).
 
 ### Conventions
 

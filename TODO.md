@@ -86,17 +86,21 @@ p99 no worse than today after short gaps and not meaningfully worse after long o
 throughput change (`bench/compare`). The phased backoff tried earlier failed because it spun *before* sleeping; this
 changes only what happens after the consumer has already been idle for a while.
 
-### TODO: Producer-triggered wake-up for low latency without a dedicated core
+### DONE: Producer-triggered wake-up for low latency without a dedicated core
 
-The default strategy wakes in 1.5-2.2us at p50 and up to 1ms at p99; `BusySpinWaitStrategy` wakes in a few hundred
-nanoseconds but costs a core per waiting goroutine. A third option is for the consumer to block (on a futex, a
-channel, or `sync.Cond`) once idle, and for the producer to wake it when it commits into an empty ring.
+Built as `ParkingWaitStrategy` (`wait_strategy_park.go`). Idle CPU is 13-57x lower than the default (pilot), but the
+wake latency after a 2us or 50us gap is worse than the default (p50 8.6-14us against 2.2us; p99 20-25us against
+13-14us), because a park-to-wake trip through the Go scheduler is slow. The `Commit` cost is the `LOCK XADD` in
+`notify`. See `FINDINGS.md` section 6c. Whether a different design (a futex, or a longer spin before the park) can
+meet the latency criterion is open.
 
-What we are looking for: a design where the producer pays only when a consumer is actually parked (one atomic load of
-a "sleeping" flag on the common path), and where no wake-up can be lost between the consumer's last empty check and
-its parking. Judge it on wake-latency p50/p99 after long gaps against the default, idle CPU against busy-spin, and the
-cost on `Commit` in `bench/compare`. It may belong in a new wait strategy (or need a new hook, since `WaitStrategy`
-has no producer-side signal today).
+### TODO: Reserved i7-12700K run of the ParkingWaitStrategy rows
+
+The section 6c numbers are a pilot on macOS, Apple M4 Pro, arm64, unreserved, with turbo not controlled. Amd64's
+`storeRelease` path (a plain `MOVQ`, where `notify`'s `LOCK XADD` is the only fence) did not run, so the fence cost on
+amd64 is unmeasured. What would settle it: the reserved `bench/suite` baseline step with the Parking rows
+(`BenchmarkWakeLatency`, `BenchmarkIdleCPU`, `BenchmarkParking`), and `bench/compare master` for the default rows. The
+verdicts to confirm or reverse are the wake p50 and p99 after long gaps, and the throughput rows of `BenchmarkParking`.
 
 ### TODO: Busy-spin's cost on the shared sequencer with one writer
 

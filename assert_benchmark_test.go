@@ -194,7 +194,7 @@ func BenchmarkWakeLatency(b *testing.B) {
 	strategies := []struct {
 		name     string
 		strategy WaitStrategy
-	}{{"Default", defaultWaitStrategy{}}, {"BusySpin", BusySpinWaitStrategy{}}}
+	}{{"Default", defaultWaitStrategy{}}, {"BusySpin", BusySpinWaitStrategy{}}, {"Parking", ParkingWaitStrategy{}}}
 	for _, item := range strategies {
 		for _, gap := range []time.Duration{0, 2 * time.Microsecond, 50 * time.Microsecond} {
 			b.Run(fmt.Sprintf("%s/SP SC/%v", item.name, gap), func(b *testing.B) { benchmarkWakeLatency(b, gap, 1, item.strategy) })
@@ -243,7 +243,7 @@ func BenchmarkIdleCPU(b *testing.B) {
 	strategies := []struct {
 		name     string
 		strategy WaitStrategy
-	}{{"Default", defaultWaitStrategy{}}, {"BusySpin", BusySpinWaitStrategy{}}}
+	}{{"Default", defaultWaitStrategy{}}, {"BusySpin", BusySpinWaitStrategy{}}, {"Parking", ParkingWaitStrategy{}}}
 	for _, item := range strategies {
 		for _, consumers := range []int{1, 2} {
 			b.Run(fmt.Sprintf("%s/Idle/%dC", item.name, consumers), func(b *testing.B) {
@@ -302,6 +302,22 @@ func BenchmarkBusySpin(b *testing.B) {
 	b.Run("Shared SP SC/R1", func(b *testing.B) { benchmarkDisruptorWith(b, reserve1, 1, nop, spin, Options.WriterCount(2)) })
 	b.Run("MP SC/R1", func(b *testing.B) { benchmarkDisruptorWith(b, reserve1, 4, nop, spin, Options.WriterCount(4)) })
 	b.Run("MP SC/R16", func(b *testing.B) { benchmarkDisruptorWith(b, reserve4, 4, nop, spin, Options.WriterCount(4)) })
+}
+
+// BenchmarkParking repeats the core throughput shapes with ParkingWaitStrategy, which adds an atomic add to every
+// Commit and every handled batch.
+func BenchmarkParking(b *testing.B) {
+	park := Options.WaitStrategy(ParkingWaitStrategy{})
+	nop := []Handler{nopHandler{}}
+	b.Run("SP SC/R1", func(b *testing.B) { benchmarkDisruptorWith(b, reserve1, 1, nop, park) })
+	b.Run("SP SC/R16", func(b *testing.B) { benchmarkDisruptorWith(b, reserve4, 1, nop, park) })
+	b.Run("SP SC/R16/1K", func(b *testing.B) { benchmarkDisruptorWith(b, reserve4, 1, nop, park, Options.BufferCapacity(1024)) })
+	b.Run("SP MC/R1", func(b *testing.B) {
+		benchmarkDisruptorWith(b, reserve1, 1, []Handler{nopHandler{}, nopHandler{}}, park)
+	})
+	b.Run("Shared SP SC/R1", func(b *testing.B) { benchmarkDisruptorWith(b, reserve1, 1, nop, park, Options.WriterCount(2)) })
+	b.Run("MP SC/R1", func(b *testing.B) { benchmarkDisruptorWith(b, reserve1, 4, nop, park, Options.WriterCount(4)) })
+	b.Run("MP SC/R16", func(b *testing.B) { benchmarkDisruptorWith(b, reserve4, 4, nop, park, Options.WriterCount(4)) })
 }
 
 type handledSequenceHandler struct{ handled atomic.Int64 }
