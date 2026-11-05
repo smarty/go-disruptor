@@ -19,19 +19,31 @@ func New(options ...option) (Disruptor, error) {
 		return nil, errors.New("no handlers have been provided")
 	}
 
+	var parker *parker
+	if strategy, ok := config.WaitStrategy.(ParkingWaitStrategy); ok {
+		config.WaitStrategy = strategy.withDefaults()
+		parker = newParker(strategy)
+	}
+
 	upperSequence := newSequence()
 	if config.WriterCount <= 1 {
-		listener, handledBarrier := config.newListeners(newAtomicBarrier(upperSequence))
+		listener, handledBarrier := config.newListeners(newAtomicBarrier(upperSequence), parker)
 		sequencer := newSequencer(config.BufferCapacity, upperSequence, handledBarrier, config.WaitStrategy)
-		return &defaultDisruptor{ListenCloser: listener, Sequencer: sequencer}, nil
+		return &defaultDisruptor{ListenCloser: listener, Sequencer: notifying(sequencer, parker)}, nil
 	}
 
 	sequencer := newSharedSequencer(config.BufferCapacity, upperSequence, config.WaitStrategy)
-	listener, handledBarrier := config.newListeners(sequencer)
+	listener, handledBarrier := config.newListeners(sequencer, parker)
 	sequencer.consumerBarrier = handledBarrier // bi-directional dependency
-	return &defaultDisruptor{ListenCloser: listener, Sequencer: sequencer}, nil
+	return &defaultDisruptor{ListenCloser: listener, Sequencer: notifying(sequencer, parker)}, nil
 }
-func (this configuration) newListeners(committedBarrier sequenceBarrier) (listener ListenCloser, handledBarrier sequenceBarrier) {
+func notifying(sequencer Sequencer, parker *parker) Sequencer {
+	if parker == nil {
+		return sequencer
+	}
+	return &notifyingSequencer{Sequencer: sequencer, parker: parker}
+}
+func (this configuration) newListeners(committedBarrier sequenceBarrier, parker *parker) (listener ListenCloser, handledBarrier sequenceBarrier) {
 	handledBarrier = committedBarrier
 
 	totalSequences := 0
@@ -47,7 +59,7 @@ func (this configuration) newListeners(committedBarrier sequenceBarrier) (listen
 		group := make([]ListenCloser, len(handlers))
 		for handlerIndex, handler := range handlers {
 			sequences[handlerIndex] = allSequences[offset+handlerIndex]
-			group[handlerIndex] = newListener(sequences[handlerIndex], committedBarrier, handledBarrier, groupIndex > 0, this.WaitStrategy, handler)
+			group[handlerIndex] = newListener(sequences[handlerIndex], committedBarrier, handledBarrier, groupIndex > 0, this.WaitStrategy, parker, handler)
 		}
 		handledBarrier = newCompositeBarrier(sequences...) // next group cannot handle beyond the sequences the current group have handled.
 		listeners[groupIndex] = newCompositeListener(group)

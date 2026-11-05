@@ -2,6 +2,7 @@ package disruptor
 
 import (
 	"sync/atomic"
+	"time"
 )
 
 // defaultListener is not goroutine-safe and is designed to run on a single goroutine. It tracks which slots or
@@ -34,6 +35,12 @@ import (
 //   - waiter: the WaitStrategy whose Gate and Idle methods are called during the gated and idle states
 //     respectively.
 //
+//   - parker: shared by every Listener of a ParkingWaitStrategy Disruptor, and nil otherwise. After more than its
+//     threshold of consecutive gated or idle iterations, the Listener parks on it instead of calling the waiter. The
+//     Listener also notifies it after each handled batch (to wake a gated downstream group) and on Close.
+//
+//   - timer: the park timeout timer, created on the first park and reused.
+//
 //   - handler: the Handler whose Handle method is called when each batch of sequence values is ready to be
 //     processed.
 type defaultListener struct {
@@ -43,10 +50,12 @@ type defaultListener struct {
 	upstreamBarrier  sequenceBarrier
 	gated            bool
 	waiter           WaitStrategy
+	parker           *parker
+	timer            *time.Timer
 	handler          Handler
 }
 
-func newListener(handledSequence *atomicSequence, committedBarrier, upstreamBarrier sequenceBarrier, gated bool, waiter WaitStrategy, handler Handler) ListenCloser {
+func newListener(handledSequence *atomicSequence, committedBarrier, upstreamBarrier sequenceBarrier, gated bool, waiter WaitStrategy, parker *parker, handler Handler) ListenCloser {
 	return &defaultListener{
 		running:          &atomic.Int64{},
 		handledSequence:  handledSequence,
@@ -54,6 +63,7 @@ func newListener(handledSequence *atomicSequence, committedBarrier, upstreamBarr
 		upstreamBarrier:  upstreamBarrier,
 		gated:            gated,
 		waiter:           waiter,
+		parker:           parker,
 		handler:          handler,
 	}
 }
@@ -69,17 +79,28 @@ func (this *defaultListener) Listen() {
 		if lowerSequence <= upperSequence {
 			this.handler.Handle(lowerSequence, upperSequence)
 			this.handledSequence.Store(upperSequence)
+			if this.parker != nil {
+				this.parker.notify() // the Store is seq-cst, and notify starts with its own full fence
+			}
 			handledSequence = upperSequence
 			gatedCount = 0
 			idlingCount = 0
 		} else if this.gated && lowerSequence <= this.committedBarrier.Load(lowerSequence) {
 			gatedCount++
 			idlingCount = 0
-			this.waiter.Gate(gatedCount)
+			if this.parker != nil && gatedCount > this.parker.threshold {
+				this.park(lowerSequence, false)
+			} else {
+				this.waiter.Gate(gatedCount)
+			}
 		} else if this.running.Load() == stateRunning {
 			idlingCount++
 			gatedCount = 0
-			this.waiter.Idle(idlingCount)
+			if this.parker != nil && idlingCount > this.parker.threshold {
+				this.park(lowerSequence, true)
+			} else {
+				this.waiter.Idle(idlingCount)
+			}
 		} else if upperSequence = this.committedBarrier.Load(lowerSequence); lowerSequence > upperSequence {
 			// Close was observed only *after* the barriers were read above (the upstream barrier, which is the committed
 			// barrier for the first group, and the committed barrier when gated), so any Commit that preceded Close may
@@ -89,8 +110,27 @@ func (this *defaultListener) Listen() {
 	}
 }
 
+// park waits until a notify, unless the upstream barrier advanced past lowerSequence (or, when idle, Close was called)
+// after prepare: the re-check after prepare is what makes a notify impossible to miss. A gated Listener does not
+// re-check the running flag, because Close does not change what it waits for, and cancelling on it would spin.
+func (this *defaultListener) park(lowerSequence int64, idle bool) {
+	ticket := this.parker.prepare()
+	if lowerSequence <= this.upstreamBarrier.Load(lowerSequence) || (idle && this.running.Load() != stateRunning) {
+		this.parker.cancel()
+		return
+	}
+
+	if this.timer == nil {
+		this.timer = time.NewTimer(this.parker.timeout)
+	}
+	this.parker.wait(ticket, this.timer)
+}
+
 func (this *defaultListener) Close() error {
 	this.running.Store(stateClosed)
+	if this.parker != nil {
+		this.parker.notify()
+	}
 	return nil
 }
 
