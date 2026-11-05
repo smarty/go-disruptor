@@ -12,3 +12,12 @@ TEXT ·storeRelease(SB), NOSPLIT, $0-16
 	MOVQ value+8(FP), BX
 	MOVQ BX, (AX)
 	RET
+
+// func fullFence()
+//
+// A locked OR of zero on the top of the stack (the return address) is a full fence that changes no memory, and it
+// touches only a line private to this goroutine. It is the Linux smp_mb idiom, and cheaper than MFENCE.
+TEXT ·fullFence(SB), NOSPLIT, $0-0
+	LOCK
+	ORQ $0, 0(SP)
+	RET

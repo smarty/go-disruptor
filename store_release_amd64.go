@@ -11,3 +11,8 @@ import "sync/atomic"
 //
 //go:noescape
 func storeRelease(address *atomic.Int64, value int64)
+
+// fullFence orders every earlier store before every later load. x86 may move a load ahead of an earlier plain store
+// such as storeRelease's MOVQ; a locked instruction drains the store buffer first. It is implemented in assembly
+// (store_release_amd64.s) and, like storeRelease, compiles only without -race.
+func fullFence()

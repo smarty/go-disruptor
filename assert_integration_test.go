@@ -1,6 +1,7 @@
 package disruptor
 
 import (
+	"fmt"
 	"math/rand/v2"
 	"sync"
 	"sync/atomic"
@@ -147,7 +148,10 @@ const (
 )
 
 // Four writers commit random batches with random idle gaps, so listeners park and wake at every gap length; every
-// handler must see every sequence exactly once, in order. The long Timeout means only a notify can wake a listener.
+// handler must see every committed sequence exactly once, in order. The long Timeout means only a notify can wake a
+// listener. A lost wake-up would only delay a handler until the next Commit, and Close drains everything, so before
+// every 64th gap each writer also waits until every handler reaches its last commit: a lost wake-up misses the 1s
+// deadline, far under the 10s Timeout.
 func TestEndToEnd_ParkingRandomGaps(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping end-to-end test")
@@ -166,7 +170,9 @@ func TestEndToEnd_ParkingRandomGaps(t *testing.T) {
 	}
 
 	gaps := []time.Duration{0, 10 * time.Microsecond, time.Millisecond, 5 * time.Millisecond}
-	var remaining atomic.Int64
+	listeners := listenersOf(subject) // in the same order as handlers
+	var failure atomic.Pointer[string]
+	var remaining, committed atomic.Int64
 	remaining.Store(totalSequences)
 	var finished sync.WaitGroup
 	finished.Add(writers)
@@ -174,7 +180,7 @@ func TestEndToEnd_ParkingRandomGaps(t *testing.T) {
 		go func() {
 			defer finished.Done()
 			random := rand.New(rand.NewPCG(uint64(writer), 2))
-			for {
+			for commits := 1; ; commits++ {
 				size := int64(1 + random.IntN(16))
 				if remaining.Add(-size) < 0 {
 					return
@@ -184,6 +190,13 @@ func TestEndToEnd_ParkingRandomGaps(t *testing.T) {
 					ring[sequence&(capacity-1)].Store(sequence)
 				}
 				subject.Commit(upper-size+1, upper)
+				committed.Add(size)
+				if commits%64 == 0 {
+					if message := awaitHandled(listeners, upper, time.Second); message != "" {
+						failure.CompareAndSwap(nil, &message)
+						return
+					}
+				}
 				if gap := gaps[random.IntN(len(gaps))]; gap > 0 {
 					time.Sleep(gap)
 				}
@@ -200,12 +213,31 @@ func TestEndToEnd_ParkingRandomGaps(t *testing.T) {
 		t.Fatal("the run did not end within 60s")
 	}
 
+	if message := failure.Load(); message != nil {
+		t.Fatal(*message)
+	}
 	for index, handler := range handlers {
 		if handler.failure != "" {
 			t.Fatalf("handler %d: %s", index, handler.failure)
 		}
-		if handler.handled < totalSequences-writers*16 {
-			t.Fatalf("handler %d: handled only %d sequences", index, handler.handled)
+		if handler.handled != committed.Load() {
+			t.Fatalf("handler %d: handled %d sequences, but %d were committed", index, handler.handled, committed.Load())
 		}
 	}
+}
+
+// awaitHandled waits until every listener has handled sequence, and returns a failure message naming the first listener
+// that did not within the deadline, or "" when all did.
+func awaitHandled(listeners []*defaultListener, sequence int64, within time.Duration) string {
+	deadline := time.Now().Add(within)
+	for index, listener := range listeners {
+		for listener.handledSequence.Load() < sequence {
+			if time.Now().After(deadline) {
+				return fmt.Sprintf("handler %d did not reach sequence %d within %v (it is at %d): a lost wake-up",
+					index, sequence, within, listener.handledSequence.Load())
+			}
+			time.Sleep(10 * time.Microsecond)
+		}
+	}
+	return ""
 }

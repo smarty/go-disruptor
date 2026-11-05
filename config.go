@@ -19,6 +19,13 @@ func New(options ...option) (Disruptor, error) {
 		return nil, errors.New("no handlers have been provided")
 	}
 
+	if pointer, ok := config.WaitStrategy.(*ParkingWaitStrategy); ok {
+		if pointer == nil {
+			return nil, errors.New("the wait strategy is a nil *ParkingWaitStrategy")
+		}
+		config.WaitStrategy = *pointer
+	}
+
 	var parker *parker
 	if strategy, ok := config.WaitStrategy.(ParkingWaitStrategy); ok {
 		config.WaitStrategy = strategy.withDefaults()

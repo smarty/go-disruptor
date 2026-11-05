@@ -304,8 +304,8 @@ func BenchmarkBusySpin(b *testing.B) {
 	b.Run("MP SC/R16", func(b *testing.B) { benchmarkDisruptorWith(b, reserve4, 4, nop, spin, Options.WriterCount(4)) })
 }
 
-// BenchmarkParking repeats the core throughput shapes with ParkingWaitStrategy, which adds an atomic add to every
-// Commit and every handled batch.
+// BenchmarkParking repeats the core throughput shapes with ParkingWaitStrategy, which adds a load of the parker's
+// waiters count to every Commit (after a full fence on amd64) and every handled batch.
 func BenchmarkParking(b *testing.B) {
 	park := Options.WaitStrategy(ParkingWaitStrategy{})
 	nop := []Handler{nopHandler{}}

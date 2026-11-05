@@ -80,7 +80,7 @@ func (this *defaultListener) Listen() {
 			this.handler.Handle(lowerSequence, upperSequence)
 			this.handledSequence.Store(upperSequence)
 			if this.parker != nil {
-				this.parker.notify() // the Store is seq-cst, and notify starts with its own full fence
+				this.parker.notify() // the Store is seq-cst, so no fence is needed before notify's load
 			}
 			handledSequence = upperSequence
 			gatedCount = 0
@@ -129,7 +129,7 @@ func (this *defaultListener) park(lowerSequence int64, idle bool) {
 func (this *defaultListener) Close() error {
 	this.running.Store(stateClosed)
 	if this.parker != nil {
-		this.parker.notify()
+		this.parker.notify() // the Store is seq-cst, so no fence is needed before notify's load
 	}
 	return nil
 }

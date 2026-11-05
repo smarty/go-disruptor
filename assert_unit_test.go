@@ -484,6 +484,39 @@ func TestParking_DefaultStrategyHasNoParker(t *testing.T) {
 	}
 }
 
+func TestParking_PointerStrategyParks(t *testing.T) {
+	handler := newLatestHandler()
+	subject, err := New(
+		Options.BufferCapacity(1024),
+		Options.WaitStrategy(&ParkingWaitStrategy{Timeout: 10 * time.Second}),
+		Options.NewHandlerGroup(handler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parker := listenersOf(subject)[0].parker
+	if parker == nil {
+		t.Fatal("a *ParkingWaitStrategy did not give the listener a parker")
+	}
+	listening := startListening(subject)
+
+	waitUntil(t, 200*time.Millisecond, func() bool { return parker.waiters.Load() == 1 }, "the listener never parked")
+	upper := subject.Reserve(1)
+	subject.Commit(upper, upper)
+	waitUntil(t, 100*time.Millisecond, func() bool { return handler.Load() == 0 }, "the parked listener did not wake on Commit")
+
+	closeAndWait(t, subject, listening)
+}
+func TestParking_NilPointerStrategyIsRejected(t *testing.T) {
+	var strategy *ParkingWaitStrategy
+	subject, err := New(
+		Options.BufferCapacity(1024),
+		Options.WaitStrategy(strategy),
+		Options.NewHandlerGroup(nopHandler{}))
+	if err == nil || subject != nil {
+		t.Fatalf("expected an error and no Disruptor, got %v and %v", err, subject)
+	}
+}
+
 func newParkingDisruptor(t *testing.T, capacity uint32, groups ...[]Handler) Disruptor {
 	t.Helper()
 	options := []option{Options.BufferCapacity(capacity), Options.WaitStrategy(ParkingWaitStrategy{Timeout: 10 * time.Second})}
