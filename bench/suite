@@ -8,9 +8,10 @@ set -euo pipefail
 #   bench/suite [validate|baseline|prefetch|all]...     (default: all, i.e. validate, baseline, then prefetch)
 #
 # Steps:
-#   validate   one round: prefetchers on vs off (MSR 0x1a4 = 0x23) with the PairChase control, asserting that the
+#   validate   one round: prefetchers on vs off (MSR 0x1a4 = --prefetch-mask) with the PairChase control, asserting that the
 #              switch took effect (PairChase at least 1.3x slower off) before any long run starts. ~1 minute.
-#   baseline   10 rounds of the sequencer, capacity, ring-buffer, wake-latency, busy-spin, and idle-CPU benchmarks.
+#   baseline   10 rounds of the sequencer, capacity, ring-buffer, wake-latency, busy-spin, parking, and idle-CPU
+#              benchmarks.
 #   prefetch   10 rounds of the same benchmarks, prefetchers on vs off, with the PairChase control. ~10 minutes.
 #
 # Options (defaults are the i7-12700K layout; any other CPU must pass all of them):
@@ -19,6 +20,8 @@ set -euo pipefail
 #   --single-producer-cpus CPUS   one thread per core, for GOMAXPROCS=4 sets (default 0,2,4,6)
 #   --multi-producer-cpus CPUS    one thread per core, for GOMAXPROCS=8 sets (default 0,2,4,6,8,10,12,14)
 #   --control-cpu CPU             CPU for the PairChase control (default 2)
+#   --prefetch-mask MASK          MSR 0x1a4 mask that turns the prefetchers off (default 0x23, Golden Cove; Intel's
+#                                 documented bits 0-3 are 0xf)
 #   --output DIRECTORY            results root (default /tmp/go-disruptor-bench/<UTC timestamp>)
 #
 # Each step writes <output>/<step>/{environment.txt,<variant>.txt,benchstat.txt}.
@@ -30,6 +33,7 @@ _housekeeping=""
 _single_producer_cpus=""
 _multi_producer_cpus=""
 _control_cpu=""
+_prefetch_mask="0x23"
 _output=""
 _benchstat=""
 _steps=()
@@ -53,7 +57,7 @@ _run_validate() {
 	_reserved_interleave --rounds 1 --output "${_directory}" --mask-cpus "${_cpus}" \
 		--set "${_control_cpu}:1:PairChase/PairChase:${_output}/bin/control.test" \
 		--set "${_single_producer_cpus}:4:^BenchmarkSequencer\$/^Commit\$" \
-		on="${_output}/bin/base.test" off="${_output}/bin/base.test@0x23"
+		on="${_output}/bin/base.test" off="${_output}/bin/base.test@${_prefetch_mask}"
 	_assert_prefetch_switch "${_directory}"
 	grep -q '^msr 0x1a4:' "${_directory}/environment.txt" || _fail "environment.txt did not record the MSR values."
 	test -O "${_directory}/on.txt" || _fail "Results in [${_directory}] are not owned by [$(id -un)]."
@@ -70,7 +74,7 @@ _run_prefetch() {
 	_log_info "Running prefetchers on vs off..."
 	_reserved_interleave --rounds 10 --output "${_output}/prefetch" --mask-cpus "${_cpus}" \
 		--set "${_control_cpu}:1:PairChase/PairChase:${_output}/bin/control.test" "${_benchmark_sets[@]}" \
-		on="${_output}/bin/base.test" off="${_output}/bin/base.test@0x23"
+		on="${_output}/bin/base.test" off="${_output}/bin/base.test@${_prefetch_mask}"
 	_assert_prefetch_switch "${_output}/prefetch"
 }
 
@@ -102,8 +106,8 @@ _build() {
 	(cd "${_repository}" && go test -c -o "${_output}/bin/base.test" . &&
 		go test -c -o "${_output}/bin/control.test" ./bench/prefetch)
 	_benchmark_sets=(
-		--set "${_single_producer_cpus}:4:(Sequencer|RingBuffer|WakeLatency|BusySpin|IdleCPU)/(SP|Default|BusySpin)"
-		--set "${_multi_producer_cpus}:8:(Sequencer|RingBuffer|BusySpin)/MP"
+		--set "${_single_producer_cpus}:4:(Sequencer|RingBuffer|WakeLatency|BusySpin|Parking|IdleCPU)/(SP|Default|BusySpin|Parking)"
+		--set "${_multi_producer_cpus}:8:(Sequencer|RingBuffer|BusySpin|Parking)/MP"
 	)
 }
 
@@ -122,6 +126,7 @@ _parse_arguments() {
 		--single-producer-cpus) _single_producer_cpus="${2}"; shift 2 ;;
 		--multi-producer-cpus) _multi_producer_cpus="${2}"; shift 2 ;;
 		--control-cpu) _control_cpu="${2}"; shift 2 ;;
+		--prefetch-mask) _prefetch_mask="${2}"; shift 2 ;;
 		--output) _output="${2}"; shift 2 ;;
 		validate | baseline | prefetch) _steps+=("${1}"); shift ;;
 		all) _steps+=(validate baseline prefetch); shift ;;
