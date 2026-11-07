@@ -497,7 +497,172 @@ by benchstat (p>0.05) except `WakeLatency/SP_SC/2us` p50, -0.9% (p=0.045, an imp
 moved +0.26%, from 10.17n to 10.20n. `New` wraps the Sequencer only for the Parking strategy, so the default path does
 not change.
 
-Open: the reserved i7-12700K run (`TODO.md`).
+Open: the reserved i7-12700K run (`TODO.md`). A reserved amd64 run on another CPU is section 6d.
+
+## 6d. `ParkingWaitStrategy` reserved on amd64 (i9-10850K): p99 verdict reversed, fence cost measured
+
+The reserved run that section 6c and `TODO.md` asked for, on Linux amd64. It is **not the i7-12700K**: it ran on
+`appa`, an Intel i9-10850K, so the Golden Cove rows above and these rows do not compare one to one.
+
+**Machine and method.**
+
+| Item        | Value                                                                                                   |
+|-------------|---------------------------------------------------------------------------------------------------------|
+| CPU         | Intel i9-10850K (Comet Lake): 10 cores, 20 threads (SMT siblings are CPU i and i+10), one NUMA node     |
+| Software    | Debian 13, kernel 6.12.115, Go 1.27.1, bare metal                                                       |
+| Reservation | `bench/reserve --cpus 0-7,10-17 --housekeeping 8,9,18,19`: cores 0 to 7 (both threads) for benchmarks;   |
+|             | every other process (systemd slices, the user manager, a Kafka container, `tailscaled`) on 8, 9, 18, 19 |
+| Sets        | single-producer sets on `0,1,2,3`, multi-producer sets on `0,1,2,3,4,5,6,7` (one thread per core);     |
+|             | PairChase on CPU 2                                                                                      |
+| State       | turbo off during each run (`reserve`), governor `performance`; MSR `0x1a4` = `0x0` on all 20 CPUs       |
+| Revision    | `2f73384` (section 6c's code plus the bench tooling change below)                                       |
+| Date        | 2026-11-06                                                                                              |
+
+Turbo, the CPU sets and the MSR values were back to their first state after every run (turbo on, `AllowedCPUs=`
+empty on `system.slice`, `user.slice` and `init.scope`, MSR `0x0`).
+
+Commands (10 shuffled rounds unless stated):
+
+```bash
+CPU="--cpus 0-7,10-17 --housekeeping 8,9,18,19 --single-producer-cpus 0,1,2,3 --multi-producer-cpus 0,1,2,3,4,5,6,7"
+bench/suite validate $CPU --control-cpu 2 --prefetch-mask 0xf     # 1 round
+bench/suite baseline $CPU --control-cpu 2
+bench/compare --base origin/master $CPU                            # master = ef0337c
+bench/suite prefetch $CPU --control-cpu 2 --prefetch-mask 0xf
+```
+
+The tooling change (commit `2f73384`): the suite's baseline step now selects the Parking rows (`BenchmarkParking` and
+the Parking rows of `BenchmarkWakeLatency` and `BenchmarkIdleCPU`), `bench/compare` takes the suite's CPU options,
+and `bench/suite --prefetch-mask` sets the mask for the validate and prefetch steps.
+
+`environment.txt` of the baseline step:
+
+```
+date: 2026-11-06 23:25:22Z
+host: appa
+cpu: Intel(R) Core(TM) i9-10850K CPU @ 3.60GHz
+kernel: 6.12.115+deb13.1-amd64
+turbo: off
+msr 0x1a4: cpu0 0x0 cpu1 0x0 cpu2 0x0 cpu3 0x0 cpu4 0x0 cpu5 0x0 cpu6 0x0 cpu7 0x0 cpu8 0x0 cpu9 0x0 cpu10 0x0 cpu11 0x0 cpu12 0x0 cpu13 0x0 cpu14 0x0 cpu15 0x0 cpu16 0x0 cpu17 0x0 cpu18 0x0 cpu19 0x0
+rounds: 10
+set: 0,1,2,3:4:(Sequencer|RingBuffer|WakeLatency|BusySpin|Parking|IdleCPU)/(SP|Default|BusySpin|Parking)
+set: 0,1,2,3,4,5,6,7:8:(Sequencer|RingBuffer|BusySpin|Parking)/MP
+variant: base=/tmp/go-disruptor-bench/appa-baseline/bin/base.test mask=original built with unknown
+```
+
+The compare, prefetch and fence runs recorded the same machine lines (dates 23:47:46Z, 23:56:11Z and 01:02:03Z, turbo
+off, MSR `0x0` on every CPU). "built with unknown" means `go` was not on root's `PATH` under `reserve`; every binary
+was built with Go 1.27.1 (the two fence binaries on macOS with `GOOS=linux GOARCH=amd64`). The raw results were in
+`/tmp/go-disruptor-bench/appa-*` on appa (tmpfs); this section is the durable record.
+
+**Single-producer rows are bimodal on this machine.** `Sequencer/SP SC` ran at about 6.0 ns in some rounds and 14 ns
+in others (median 12.8 ns, ±53%), and so did `SP MC`, `SP4SC`, `SP4MC` and the `BusySpin` and `Parking` `SP SC` rows.
+The shared-sequencer, ring-buffer and multi-producer rows are tight (±0-7%). The likely cause is where the Go
+scheduler puts the producer and the consumer inside the 4-CPU set (the "Pin benchmark producers and consumers"
+item); this run did not check it. Read the medians of those rows as rough.
+
+**Criterion 1, idle CPU at least 10x lower than the default.** `BenchmarkIdleCPU`, median cores:
+
+| Consumers | Default idle | Parking idle | Default sparse | Parking sparse | BusySpin idle / sparse |
+|-----------|--------------|--------------|----------------|----------------|------------------------|
+| 1         | 0.755        | 0.0171 (44x) | 0.421          | 0.0456 (9.2x)  | 0.998 / 1.016          |
+| 2         | 1.026        | 0.0255 (40x) | 0.993          | 0.0829 (12x)   | 1.997 / 2.014          |
+
+Met for idle (40-44x). The one-consumer sparse row is just under 10x (9.2x). The default costs 0.76 and 1.03 cores
+idle here (0.55 and 0.84 on the i7, section 6b).
+
+**Criterion 2, wake p50 and p99 after long gaps no worse than the default.** `BenchmarkWakeLatency`, medians, p50 /
+p99, `SP SC` (the `Shared SP SC` rows are within 5% of these):
+
+| Gap  | Default           | Parking         | BusySpin      | Parking, pilot (6c) |
+|------|-------------------|-----------------|---------------|---------------------|
+| 0    | 2.91 / 3.80us     | 331 / 341ns     | 332 / 339ns   | 84 / 292ns          |
+| 2us  | 905ns / 1.87us    | 457 / 496ns     | 435 / 449ns   | 8.63 / 19.7us       |
+| 50us | 1.81us / 1.02ms   | 59.7 / 60.9us   | 462 / 509ns   | 14.1 / 24.5us       |
+
+- **p99 after a long gap: reversed, now met.** On Linux the default's p99 after 50us is 1.02ms, the `epoll` 1ms floor
+  of section 6a, as section 6c expected. Parking's p99 is 60.9us, 17x better.
+- **p50 after a long gap: confirmed, not met.** Parking's p50 after 50us is 59.7us against the default's 1.8us, 33x
+  worse.
+- **After 2us, Parking does not park on this CPU.** It wakes in 457ns at p50, better than the default (905ns) and
+  close to BusySpin. A likely reason: `spinHint` is eight `PAUSE`s, a `PAUSE` takes about 140 cycles on Skylake and
+  later cores, so 64 spins and 16 yields last tens of microseconds, far longer than on the M4 Pro. This run did not
+  time the spin phase.
+- **The park-to-wake trip costs about 60us here, against 8-14us on the M4 Pro**, with a spread under 1%. It is not the
+  deep C-states: a diagnostic with C2 and C3 disabled on the benchmark CPUs (5 single rounds each way, one binary)
+  gave 59.6 / 60.4us with them off and 59.6 / 61.0us with them on. The cause is open.
+- The parked path allocates as in section 6c: 112-114 B/op and 1 alloc/op in the 50us rows.
+
+**Criterion 3, the cost on `Commit`, and the amd64 fence.** Throughput, medians of the baseline step, and the
+fence diagnostic below:
+
+| Row             | BusySpin        | Parking         | Parking without `fullFence` (diagnostic) |
+|-----------------|-----------------|-----------------|------------------------------------------|
+| SP SC/R1        | 11.4n (bimodal) | 30.2n (bimodal) | 19.6n                                    |
+| SP SC/R16       | 0.41n           | 2.04n           | 1.30n                                    |
+| SP MC/R1        | 15.7n (bimodal) | 38.9n (bimodal) | 26.9n                                    |
+| Shared SP SC/R1 | 19.4n           | 33.2n           | 24.5n                                    |
+| MP SC/R1        | 30.4n           | 46.0n           | 31.2n                                    |
+| MP SC/R16       | 1.78n           | 2.90n           | 1.92n                                    |
+
+The diagnostic isolates `fullFence`: two binaries of the same commit, one as shipped and one with `fullFence` as a
+bare `RET` (not correct; for measurement only, never committed). `objdump` showed `LOCK ORQ $0x0, 0(SP)` in the first
+and only `RET` in the second. Reserved as above, 10 shuffled rounds, the Parking and BusySpin families and the Parking
+wake rows:
+
+| Row                     | With fence | Without fence | Delta              |
+|-------------------------|------------|---------------|--------------------|
+| Parking SP SC/R1        | 38.24n     | 19.61n        | -48.7% (p=0.001)   |
+| Parking SP SC/R16       | 2.752n     | 1.301n        | -52.8% (p=0.002)   |
+| Parking SP SC/R16/1K    | 2.411n     | 1.213n        | -49.7% (p=0.002)   |
+| Parking SP MC/R1        | 41.62n     | 26.92n        | -35.3% (p=0.035)   |
+| Parking Shared SP SC/R1 | 33.75n     | 24.52n        | -27.4% (p=0.000)   |
+| Parking MP SC/R1        | 45.15n     | 31.20n        | -30.9% (p=0.000)   |
+| Parking MP SC/R16       | 2.907n     | 1.920n        | -34.0% (p=0.000)   |
+| BusySpin rows (7)       | —          | —             | ~                  |
+| Parking wake rows (6)   | —          | —             | ~ (two p50/p99 rows -2% to -5%, p<0.05) |
+
+- **The amd64 fence costs about 19-23ns per `Commit` with one writer** (18.6ns at R1; 1.45ns per slot at R16, which is
+  23ns per 16-slot Commit), 9-14ns on the shared sequencer, and nothing measurable on wake latency. That is about two
+  thirds of Parking's extra cost over BusySpin on amd64. The rest (about 8ns at R1: 19.6ns against BusySpin's 11.9ns
+  in the same run) is the load of `waiters` and the notify call.
+- The `LOCK ORQ` touches only the goroutine's own stack line, but a locked instruction drains the store buffer. The
+  buffer holds `Commit`'s plain store to the cursor line, which the consumer's core usually owns, so the fence waits for
+  that line: the same wait that the release store removed from `Commit` (section 6). This explanation fits the
+  numbers; no `perf` counter checked it.
+- On arm64 (section 6c) Parking `SP SC/R1` was 21.5ns against BusySpin's 16.0ns. On amd64 it is 30-38ns against about
+  12ns. Parking stays a strategy for idle and sparse traffic; on amd64 a dense single writer pays about 2.5-3x
+  BusySpin's time per `Commit`.
+
+**Criterion 4, no default-strategy row regresses: met.** `bench/compare --base origin/master` (`ef0337c`), 10 rounds:
+every row `~` except `SharedSequencer/MP_MC/R4`, -5.0% (p=0.001, an improvement). Geomean 5.709n to 5.520n (-3.3%,
+from the bimodal single-producer rows, none significant). `Sequencer/Commit` is 1.832ns in both.
+
+**Prefetchers on Comet Lake: Intel's documented bits work.** The validate step with mask `0xf` (bits 0-3: L2
+streamer, L2 adjacent line, L1 next line, L1 IP stride) passed: PairChase 86.9ns on, 134.8ns off (1.55x). The CPU
+took the mask on all 16 benchmark CPUs, and `0x0` came back after. So the prefetch step ran (PairChase 86.8ns and
+134.7ns). Prefetchers off against on:
+
+| Row                                            | On              | Off             | Delta            |
+|------------------------------------------------|-----------------|-----------------|------------------|
+| SharedSequencer/SP_SC/R1                       | 13.79n          | 16.60n          | +20.4%           |
+| SharedSequencerCapacity/SP_SC/R1 (1K to 256K)  | 12.80n - 18.20n | 15.04n - 24.59n | +17.5% to +35.1% |
+| SharedSequencerCapacity/MP_SC/R1/1K            | 31.52n          | 42.34n          | +34.3%           |
+| RingBuffer/SP_SC/R1                            | 10.72n          | 24.75n          | +130.8%          |
+| RingBuffer/SP_SC/R4                            | 2.944n          | 4.407n          | +49.7%           |
+| BusySpin/Shared_SP_SC/R1                       | 19.93n          | 22.50n          | +12.9%           |
+| BusySpin/MP_SC/R16                             | 1.777n          | 1.955n          | +10.0%           |
+| SharedSequencer/MP_SC/R4                       | 2.262n          | 1.981n          | -12.4%           |
+| WakeLatency/Default, 0 and 2us (ns/op)         | —               | —               | -3.5% to -6.7%   |
+| Sequencer, Parking, IdleCPU, other wake rows   | —               | —               | ~                |
+
+- The shared sequencer depends on prefetching here too (+18-35%; the i7: +19-25%, section 4), and the single-writer
+  ring buffer depends on it most (+131%).
+- `SharedSequencer/MP_SC/R4` runs 12% faster without the prefetchers, the same direction as the i7's `RingBuffer MP
+  SC/R4` (section 5), but here `RingBuffer/MP_SC/R4` is `~`.
+
+Open: the i7-12700K run itself (Golden Cove numbers), the cause of the 60us park-to-wake trip on Linux, and the bimodal
+single-producer rows.
 
 ## 7. Tooling lessons
 

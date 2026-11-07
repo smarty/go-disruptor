@@ -86,30 +86,52 @@ p99 no worse than today after short gaps and not meaningfully worse after long o
 throughput change (`bench/compare`). The phased backoff tried earlier failed because it spun *before* sleeping; this
 changes only what happens after the consumer has already been idle for a while.
 
+The reserved i9-10850K run (`FINDINGS.md` section 6d, 2026-11-06) gives today's numbers on a second Intel CPU: the
+default costs 0.755 cores idle (1.026 for two consumers) and 0.421 / 0.993 sparse; its p99 after a 50us gap is
+1.02ms and its p50 1.8us; after a 2us gap, 905ns / 1.87us. It confirms the 1ms `epoll` tail on Linux. It does not
+settle this item: no escalating `Idle` was built or measured.
+
 ### PARTIAL: Producer-triggered wake-up for low latency without a dedicated core
 
-- Built: `ParkingWaitStrategy` (`wait_strategy_park.go`). See `FINDINGS.md` section 6c.
-- Idle CPU criterion: met. Idle CPU is 13-57x lower than the default (pilot).
-- Wake-latency-after-gaps criterion: not met (pilot). After a 2us or 50us gap, p50 is 8.6-14us against the default's
-  2.2us, and p99 is 20-25us against 13-14us. A park-to-wake trip through the Go scheduler is the cost.
-- The `Commit` cost is one load of `waiters` (plus `fullFence` on amd64 without `-race`), not a read-modify-write.
+- Built: `ParkingWaitStrategy` (`wait_strategy_park.go`). See `FINDINGS.md` sections 6c and 6d.
+- Idle CPU criterion: met. Idle CPU is 13-57x lower than the default (pilot), and 40-44x lower idle, 9.2-12x lower
+  sparse, on the reserved i9-10850K (section 6d).
+- Wake-latency-after-gaps criterion, p99: met on Linux amd64 (section 6d). After a 50us gap Parking's p99 is 60.9us
+  against the default's 1.02ms. The pilot (macOS, where the default has no 1ms tail) did not meet it.
+- Wake-latency-after-gaps criterion, p50: not met, confirmed on Linux amd64. After a 50us gap p50 is 59.7us against
+  the default's 1.8us (pilot: 14.1us against 2.2us). After a 2us gap the i9 does not park yet (457ns, better than the
+  default), because eight `PAUSE`s per spin make the spin phase much longer on Intel than on Apple cores.
+- The `Commit` cost is one load of `waiters` plus `fullFence` on amd64 without `-race`. The fence costs about 19-23ns
+  per single-writer `Commit` on the i9 (section 6d), about two thirds of Parking's extra cost over BusySpin there.
 
 What would settle it:
 
-- The reserved i7-12700K run (next item). On Linux the default's p99 after a gap is about 1ms (section 6a), so the
-  p99 verdict can reverse there.
+- The park-to-wake trip: about 60us on Linux amd64 (8-14us on the M4 Pro). Not the deep C-states (section 6d). Find
+  where the time goes (a runtime trace, `go tool trace`, of the parked Listener and the waking Commit), and cut it.
+- A cheaper fence on amd64, or none: for example, a `notify` path that avoids draining the store buffer on every
+  Commit while keeping Dekker's ordering. Measure it against section 6d's fence diagnostic.
 - A time-based spin budget: spin and yield for a fixed time (for example 50-100us) before the park, in place of a
   fixed count of calls. A gap shorter than the budget then never parks. Measure it with `BenchmarkWakeLatency` and
   `BenchmarkIdleCPU`, because a longer budget costs idle CPU.
 
-### TODO: Reserved i7-12700K run of the ParkingWaitStrategy rows
+### PARTIAL: Reserved i7-12700K run of the ParkingWaitStrategy rows
 
-The section 6c numbers are a pilot on macOS, Apple M4 Pro, arm64, unreserved, with turbo not controlled. Amd64's
-`storeRelease` path (a plain `MOVQ`, where `fullFence`'s `LOCK ORQ` before the load of `waiters` is the only fence) did
-not run, so the fence cost on amd64 is unmeasured. What would settle it: the reserved `bench/suite` baseline step
-with the Parking rows (`BenchmarkWakeLatency`, `BenchmarkIdleCPU`, `BenchmarkParking`), and `bench/compare master`
-for the default rows. The verdicts to confirm or reverse are the wake p50 and p99 after long gaps, and the throughput
-rows of `BenchmarkParking`.
+The section 6c numbers are a pilot on macOS, Apple M4 Pro, arm64, unreserved, with turbo not controlled. The reserved
+run asked for here (the `bench/suite` baseline step with the Parking rows, and `bench/compare master` for the default
+rows) ran on 2026-11-06 on an i9-10850K (Comet Lake), not on the i7-12700K: `FINDINGS.md` section 6d.
+
+Settled by that run, on Linux amd64:
+
+- Wake p99 after a long gap: reversed, now met (60.9us against the default's 1.02ms).
+- Wake p50 after a long gap: confirmed, not met (59.7us against 1.8us).
+- `BenchmarkParking` throughput: Parking `SP SC/R1` is about 30-38ns against BusySpin's 11-12ns (arm64: 21.5 against
+  16.0ns).
+- The amd64 fence cost: measured. `fullFence` (`LOCK ORQ`) costs about 19-23ns per single-writer `Commit` and
+  9-14ns on the shared sequencer; it does not change wake latency.
+- The default rows: no regression against master (all `~`, one row -5%).
+
+Still open: the same rows on the i7-12700K (Golden Cove), if Golden Cove numbers are wanted. `bench/suite` now
+selects the Parking rows in its baseline step, and `bench/compare` takes the CPU options.
 
 ### TODO: Busy-spin's cost on the shared sequencer with one writer
 
@@ -167,8 +189,8 @@ Everything adopted since 2026-09-26 was measured only on the i7-12700K: the rele
 `Load`, and `BusySpinWaitStrategy`. The earlier Performance Findings came from the Threadripper 3970X (Zen 2), where
 `XCHG` was 51-58% of single-writer cycles, so the release store should help at least as much there. What we are
 looking for: `bench/compare` against the commit before each change, and `bench/suite baseline`, on the Threadripper.
-Both scripts currently hard-code the i7-12700K's CPU layout: `bench/suite` accepts the CPU options, but
-`bench/compare` needs them added first. Multi-producer rows there are ±10-25% across CCXs, so only large, replicated
+Both scripts default to the i7-12700K's CPU layout, and both accept the CPU options (`bench/compare` since
+`2f73384`). Multi-producer rows there are ±10-25% across CCXs, so only large, replicated
 deltas count.
 
 ### TODO: Pin benchmark producers and consumers to chosen cores
