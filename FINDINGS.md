@@ -591,8 +591,8 @@ p99, `SP SC` (the `Shared SP SC` rows are within 5% of these):
 - **The park-to-wake trip costs about 60us here, against 8-14us on the M4 Pro**, with a spread under 1%. It is not the
   deep C-states: a diagnostic with C2 and C3 disabled on the benchmark CPUs (5 single rounds each way, one binary)
   gave 59.6 / 60.4us with them off and 59.6 / 61.0us with them on. The record does not say whether the C-states were
-  restored after this diagnostic. The box was later found with no CPU sets and turbo on (2026-11-07); the C-state
-  state was not checked. The cause is open.
+  restored after this diagnostic. The box was later found with no CPU sets and turbo on (2026-11-07), and with every
+  idle state enabled on CPUs 0-3 (2026-11-09). The cause is open.
 - The parked path allocates as in section 6c: 112-114 B/op and 1 alloc/op in the 50us rows.
 
 **Criterion 3, the cost on `Commit`, and the amd64 fence.** Throughput, medians of the baseline step, and the
