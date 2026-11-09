@@ -590,7 +590,9 @@ p99, `SP SC` (the `Shared SP SC` rows are within 5% of these):
   time the spin phase.
 - **The park-to-wake trip costs about 60us here, against 8-14us on the M4 Pro**, with a spread under 1%. It is not the
   deep C-states: a diagnostic with C2 and C3 disabled on the benchmark CPUs (5 single rounds each way, one binary)
-  gave 59.6 / 60.4us with them off and 59.6 / 61.0us with them on. The cause is open.
+  gave 59.6 / 60.4us with them off and 59.6 / 61.0us with them on. The record does not say whether the C-states were
+  restored after this diagnostic. The box was later found with no CPU sets and turbo on (2026-11-07); the C-state
+  state was not checked. The cause is open.
 - The parked path allocates as in section 6c: 112-114 B/op and 1 alloc/op in the 50us rows.
 
 **Criterion 3, the cost on `Commit`, and the amd64 fence.** Throughput, medians of the baseline step, and the
@@ -604,6 +606,10 @@ fence diagnostic below:
 | Shared SP SC/R1 | 19.4n           | 33.2n           | 24.5n                                    |
 | MP SC/R1        | 30.4n           | 46.0n           | 31.2n                                    |
 | MP SC/R16       | 1.78n           | 2.90n           | 1.92n                                    |
+
+The `Parking` column above is the baseline run. The diagnostic column (19.6n) comes from the fence run below, where
+the same row measured 38.24n. Compare the fence cost inside the fence run (38.24n against 19.61n), not across the two
+runs.
 
 The diagnostic isolates `fullFence`: two binaries of the same commit, one as shipped and one with `fullFence` as a
 bare `RET` (not correct; for measurement only, never committed). `objdump` showed `LOCK ORQ $0x0, 0(SP)` in the first
@@ -623,9 +629,9 @@ wake rows:
 | Parking wake rows (6)   | —          | —             | ~ (two p50/p99 rows -2% to -5%, p<0.05) |
 
 - **The amd64 fence costs about 19-23ns per `Commit` with one writer** (18.6ns at R1; 1.45ns per slot at R16, which is
-  23ns per 16-slot Commit), 9-14ns on the shared sequencer, and nothing measurable on wake latency. That is about two
-  thirds of Parking's extra cost over BusySpin on amd64. The rest (about 8ns at R1: 19.6ns against BusySpin's 11.9ns
-  in the same run) is the load of `waiters` and the notify call.
+  23ns per 16-slot Commit), 9-14ns on the shared sequencer, and nothing measurable on wake latency. Within the fence run at R1,
+  Parking costs 38.24ns and BusySpin 11.9ns, so Parking's extra cost is 26.3ns. The fence is 18.6ns of it, about 70%.
+  The rest (about 7.7ns: 19.61ns against BusySpin's 11.9ns) is the load of `waiters` and the notify call.
 - The `LOCK ORQ` touches only the goroutine's own stack line, but a locked instruction drains the store buffer. The
   buffer holds `Commit`'s plain store to the cursor line, which the consumer's core usually owns, so the fence waits for
   that line: the same wait that the release store removed from `Commit` (section 6). This explanation fits the

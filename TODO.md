@@ -94,15 +94,17 @@ settle this item: no escalating `Idle` was built or measured.
 ### PARTIAL: Producer-triggered wake-up for low latency without a dedicated core
 
 - Built: `ParkingWaitStrategy` (`wait_strategy_park.go`). See `FINDINGS.md` sections 6c and 6d.
-- Idle CPU criterion: met. Idle CPU is 13-57x lower than the default (pilot), and 40-44x lower idle, 9.2-12x lower
-  sparse, on the reserved i9-10850K (section 6d).
+- Idle CPU criterion: met for idle, not quite for the one-consumer sparse row. Idle CPU is 13-57x lower than the
+  default (pilot), and 40-44x lower idle on the reserved i9-10850K (section 6d). Sparse is 9.2x lower with one
+  consumer (under 10x) and 12x lower with two.
 - Wake-latency-after-gaps criterion, p99: met on Linux amd64 (section 6d). After a 50us gap Parking's p99 is 60.9us
   against the default's 1.02ms. The pilot (macOS, where the default has no 1ms tail) did not meet it.
 - Wake-latency-after-gaps criterion, p50: not met, confirmed on Linux amd64. After a 50us gap p50 is 59.7us against
   the default's 1.8us (pilot: 14.1us against 2.2us). After a 2us gap the i9 does not park yet (457ns, better than the
-  default), because eight `PAUSE`s per spin make the spin phase much longer on Intel than on Apple cores.
+  default). A likely reason is that eight `PAUSE`s per spin make the spin phase much longer on Intel than on Apple
+  cores. The run did not time the spin phase.
 - The `Commit` cost is one load of `waiters` plus `fullFence` on amd64 without `-race`. The fence costs about 19-23ns
-  per single-writer `Commit` on the i9 (section 6d), about two thirds of Parking's extra cost over BusySpin there.
+  per single-writer `Commit` on the i9 (section 6d), about 70% of Parking's extra cost over BusySpin there (within the fence run: 18.6ns of 26.3ns).
 
 What would settle it:
 
