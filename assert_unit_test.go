@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -55,7 +56,7 @@ func TestListen_DrainsCommitRacingWithClose(t *testing.T) {
 	handled := int64(defaultSequenceValue)
 	var listener ListenCloser
 	barrier := &racingCommitBarrier{committed: committed, listener: &listener}
-	listener = newListener(newSequence(), barrier, newAtomicBarrier(committed), true, defaultWaitStrategy{}, recordingHandler{handled: &handled})
+	listener = newListener(newSequence(), barrier, newAtomicBarrier(committed), true, defaultWaitStrategy{}, nil, recordingHandler{handled: &handled})
 
 	listener.Listen()
 
@@ -70,7 +71,7 @@ func TestListen_FirstGroupDrainsCommitRacingWithClose(t *testing.T) {
 	handled := int64(defaultSequenceValue)
 	var listener ListenCloser
 	barrier := &racingCommitBarrier{committed: committed, listener: &listener}
-	listener = newListener(newSequence(), barrier, barrier, false, defaultWaitStrategy{}, recordingHandler{handled: &handled})
+	listener = newListener(newSequence(), barrier, barrier, false, defaultWaitStrategy{}, nil, recordingHandler{handled: &handled})
 
 	listener.Listen()
 
@@ -87,7 +88,7 @@ func TestListen_OnlyGatedListenersCallGate(t *testing.T) {
 		var listener ListenCloser
 		barrier := &committingBarrier{committed: committed}
 		waiter := &closingWaitStrategy{listener: &listener}
-		listener = newListener(newSequence(), barrier, barrier, gated, waiter, recordingHandler{handled: &handled})
+		listener = newListener(newSequence(), barrier, barrier, gated, waiter, nil, recordingHandler{handled: &handled})
 
 		listener.Listen()
 
@@ -298,6 +299,9 @@ func TestSharedLoad_RejectsMarkerStaleForManyLaps(t *testing.T) {
 // Concurrent writers reserving random batch sizes across many laps of a small ring buffer, through a two-group
 // pipeline; every handler must observe every sequence exactly once, in order, with the value the writer stored.
 func TestShared_RandomBatchesAcrossLaps(t *testing.T) { testRandomBatchesAcrossLaps(t, 4, 200_000) }
+func TestParking_RandomBatchesAcrossLaps(t *testing.T) {
+	testRandomBatchesAcrossLaps(t, 4, 200_000, Options.WaitStrategy(ParkingWaitStrategy{}))
+}
 func TestBusySpin_RandomBatchesAcrossLaps(t *testing.T) {
 	// Every writer and handler spins without yielding, so each needs a processor of its own (see BusySpinWaitStrategy).
 	// 50,000 sequences still lap the 64-slot ring ~780 times, and keep the -race pass well inside make test's timeout.
@@ -358,6 +362,207 @@ func testRandomBatchesAcrossLaps(t *testing.T, writers int, totalSequences int64
 		}
 		if handler.handled < totalSequences-int64(writers)*16 {
 			t.Fatalf("handler %d: handled only %d sequences", index, handler.handled)
+		}
+	}
+}
+
+// Every parking test uses a Timeout far longer than its deadline, so only a notify can wake a parked listener in time.
+func TestParking_WakesOnCommit(t *testing.T) {
+	handler := newLatestHandler()
+	subject := newParkingDisruptor(t, 1024, []Handler{handler})
+	parker := listenersOf(subject)[0].parker
+	listening := startListening(subject)
+
+	waitUntil(t, 200*time.Millisecond, func() bool { return parker.waiters.Load() == 1 }, "the listener never parked")
+	upper := subject.Reserve(1)
+	subject.Commit(upper, upper)
+	waitUntil(t, 100*time.Millisecond, func() bool { return handler.Load() == 0 }, "the parked listener did not wake on Commit")
+
+	closeAndWait(t, subject, listening)
+}
+func TestParking_CommitRacingWithPark(t *testing.T) {
+	// The producer commits sequence 0 while the listener parks: either just before the listener's barrier re-check
+	// (which must see it and cancel), or just after the re-check read the empty barrier (so the notify must move the
+	// epoch, and wait must return at once instead of waiting for a signal that was already sent).
+	for _, afterRead := range []bool{false, true} {
+		strategy := ParkingWaitStrategy{Timeout: 10 * time.Second}
+		parker := newParker(strategy)
+		committed, handledSequence := newSequence(), newSequence()
+		sequencer := &notifyingSequencer{Sequencer: newSequencer(4, committed, newAtomicBarrier(handledSequence), strategy), parker: parker}
+		barrier := &parkRacingBarrier{committed: committed, parker: parker, sequencer: sequencer, afterRead: afterRead}
+		handler := newLatestHandler()
+		listener := newListener(handledSequence, barrier, barrier, false, strategy, parker, handler)
+		listening := startListening(listener)
+
+		waitUntil(t, 100*time.Millisecond, func() bool { return handler.Load() == 0 }, "the commit racing with the park was not handled in time")
+		closeAndWait(t, listener, listening)
+		if waiters := parker.waiters.Load(); waiters != 0 {
+			t.Fatalf("afterRead=%v: expected 0 waiters, got %d", afterRead, waiters)
+		}
+	}
+}
+func TestParking_CloseWakesParkedListeners(t *testing.T) {
+	first, second := newLatestHandler(), newLatestHandler()
+	subject := newParkingDisruptor(t, 1024, []Handler{first}, []Handler{second})
+	parker := listenersOf(subject)[0].parker
+	listening := startListening(subject)
+
+	waitUntil(t, 200*time.Millisecond, func() bool { return parker.waiters.Load() == 2 }, "both listeners never parked")
+	upper := subject.Reserve(1)
+	subject.Commit(upper, upper)
+	closeAndWait(t, subject, listening)
+
+	if first.Load() != 0 || second.Load() != 0 {
+		t.Fatalf("expected both handlers to see 0, got %d and %d", first.Load(), second.Load())
+	}
+}
+func TestParking_GatedGroupWakes(t *testing.T) {
+	// Sequence 0 is committed before Listen, so the first group blocks in its handler and the second group only ever
+	// gates (and then parks) waiting for it.
+	first, second := newBlockingHandler(), newLatestHandler()
+	subject := newParkingDisruptor(t, 1024, []Handler{first}, []Handler{second})
+	parker := listenersOf(subject)[0].parker
+	upper := subject.Reserve(1)
+	subject.Commit(upper, upper)
+	listening := startListening(subject)
+
+	waitUntil(t, 200*time.Millisecond, func() bool { return parker.waiters.Load() == 1 }, "the gated listener never parked")
+	close(first.release)
+	waitUntil(t, 100*time.Millisecond, func() bool { return second.Load() == 0 }, "the gated listener did not wake when the first group advanced")
+
+	closeAndWait(t, subject, listening)
+}
+func TestParking_ProducerWaitsOnFullRing(t *testing.T) {
+	handler := newBlockingHandler()
+	subject := newParkingDisruptor(t, 4, []Handler{handler})
+	listening := startListening(subject)
+	for range 4 {
+		upper := subject.Reserve(1)
+		subject.Commit(upper, upper)
+	}
+
+	reserved := make(chan int64, 1)
+	go func() { reserved <- subject.Reserve(1) }()
+	select {
+	case upper := <-reserved:
+		t.Fatalf("Reserve returned %d on a full ring", upper)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(handler.release)
+	select {
+	case upper := <-reserved:
+		if upper != 4 {
+			t.Fatalf("expected Reserve to return 4, got %d", upper)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Reserve did not return after the handler was released")
+	}
+	subject.Commit(4, 4)
+	closeAndWait(t, subject, listening)
+}
+func TestParking_DefaultStrategyHasNoParker(t *testing.T) {
+	subject, err := New(
+		Options.BufferCapacity(1024),
+		Options.NewHandlerGroup(nopHandler{}, nopHandler{}),
+		Options.NewHandlerGroup(nopHandler{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, wrapped := subject.(*defaultDisruptor).Sequencer.(*notifyingSequencer); wrapped {
+		t.Fatal("the default strategy must not wrap the Sequencer")
+	}
+	listeners := listenersOf(subject)
+	if len(listeners) != 3 {
+		t.Fatalf("expected 3 listeners, got %d", len(listeners))
+	}
+	for index, listener := range listeners {
+		if listener.parker != nil {
+			t.Fatalf("listener %d has a parker under the default strategy", index)
+		}
+	}
+}
+
+func TestParking_PointerStrategyParks(t *testing.T) {
+	handler := newLatestHandler()
+	subject, err := New(
+		Options.BufferCapacity(1024),
+		Options.WaitStrategy(&ParkingWaitStrategy{Timeout: 10 * time.Second}),
+		Options.NewHandlerGroup(handler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parker := listenersOf(subject)[0].parker
+	if parker == nil {
+		t.Fatal("a *ParkingWaitStrategy did not give the listener a parker")
+	}
+	listening := startListening(subject)
+
+	waitUntil(t, 200*time.Millisecond, func() bool { return parker.waiters.Load() == 1 }, "the listener never parked")
+	upper := subject.Reserve(1)
+	subject.Commit(upper, upper)
+	waitUntil(t, 100*time.Millisecond, func() bool { return handler.Load() == 0 }, "the parked listener did not wake on Commit")
+
+	closeAndWait(t, subject, listening)
+}
+func TestParking_NilPointerStrategyIsRejected(t *testing.T) {
+	var strategy *ParkingWaitStrategy
+	subject, err := New(
+		Options.BufferCapacity(1024),
+		Options.WaitStrategy(strategy),
+		Options.NewHandlerGroup(nopHandler{}))
+	if err == nil || subject != nil {
+		t.Fatalf("expected an error and no Disruptor, got %v and %v", err, subject)
+	}
+}
+
+func newParkingDisruptor(t *testing.T, capacity uint32, groups ...[]Handler) Disruptor {
+	t.Helper()
+	options := []option{Options.BufferCapacity(capacity), Options.WaitStrategy(ParkingWaitStrategy{Timeout: 10 * time.Second})}
+	for _, handlers := range groups {
+		options = append(options, Options.NewHandlerGroup(handlers...))
+	}
+	subject, err := New(options...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return subject
+}
+func listenersOf(subject Disruptor) (listeners []*defaultListener) {
+	var walk func(ListenCloser)
+	walk = func(item ListenCloser) {
+		switch typed := item.(type) {
+		case *defaultListener:
+			listeners = append(listeners, typed)
+		case compositeListener:
+			for _, child := range typed {
+				walk(child)
+			}
+		}
+	}
+	walk(subject.(*defaultDisruptor).ListenCloser)
+	return listeners
+}
+func startListening(listener ListenCloser) chan struct{} {
+	finished := make(chan struct{})
+	go func() { defer close(finished); listener.Listen() }()
+	return finished
+}
+func closeAndWait(t *testing.T, listener ListenCloser, finished chan struct{}) {
+	t.Helper()
+	_ = listener.Close()
+	select {
+	case <-finished:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Listen did not return within 100ms of Close")
+	}
+}
+func waitUntil(t *testing.T, within time.Duration, condition func() bool, failure string) {
+	t.Helper()
+	for deadline := time.Now().Add(within); !condition(); time.Sleep(100 * time.Microsecond) {
+		if time.Now().After(deadline) {
+			t.Fatal(failure)
 		}
 	}
 }
@@ -428,6 +633,58 @@ type closingWaitStrategy struct {
 
 func (this *closingWaitStrategy) Gate(int64) { this.gates++ }
 func (this *closingWaitStrategy) Idle(int64) { _ = (*this.listener).Close() }
+
+// parkRacingBarrier simulates a producer whose Commit lands during the listener's barrier re-check after prepare (the
+// only Load that sees a waiter): before the re-check reads the committed sequence, or just after it.
+type parkRacingBarrier struct {
+	committed *atomicSequence
+	parker    *parker
+	sequencer Sequencer
+	afterRead bool
+	fired     bool
+}
+
+func (this *parkRacingBarrier) Load(_ int64) int64 {
+	if this.fired || this.parker.waiters.Load() == 0 {
+		return this.committed.Load()
+	}
+	this.fired = true
+	if !this.afterRead {
+		this.commit()
+	}
+	value := this.committed.Load()
+	if this.afterRead {
+		this.commit()
+	}
+	return value
+}
+func (this *parkRacingBarrier) commit() {
+	upper := this.sequencer.Reserve(1)
+	this.sequencer.Commit(upper, upper) // producer: Commit(0, 0), then notify
+}
+
+// latestHandler records the upper sequence of the latest batch it handled; it starts at -1.
+type latestHandler struct{ atomic.Int64 }
+
+func newLatestHandler() *latestHandler {
+	this := &latestHandler{}
+	this.Store(defaultSequenceValue)
+	return this
+}
+func (this *latestHandler) Handle(_, upper int64) { this.Store(upper) }
+
+// blockingHandler blocks in Handle until release is closed.
+type blockingHandler struct {
+	latestHandler
+	release chan struct{}
+}
+
+func newBlockingHandler() *blockingHandler {
+	this := &blockingHandler{release: make(chan struct{})}
+	this.Store(defaultSequenceValue)
+	return this
+}
+func (this *blockingHandler) Handle(_, upper int64) { <-this.release; this.Store(upper) }
 
 type orderingHandler struct {
 	ring    []atomic.Int64

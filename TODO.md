@@ -86,17 +86,54 @@ p99 no worse than today after short gaps and not meaningfully worse after long o
 throughput change (`bench/compare`). The phased backoff tried earlier failed because it spun *before* sleeping; this
 changes only what happens after the consumer has already been idle for a while.
 
-### TODO: Producer-triggered wake-up for low latency without a dedicated core
+The reserved i9-10850K run (`FINDINGS.md` section 6d, 2026-11-06) gives today's numbers on a second Intel CPU: the
+default costs 0.755 cores idle (1.026 for two consumers) and 0.421 / 0.993 sparse; its p99 after a 50us gap is
+1.02ms and its p50 1.8us; after a 2us gap, 905ns / 1.87us. It confirms the 1ms `epoll` tail on Linux. It does not
+settle this item: no escalating `Idle` was built or measured.
 
-The default strategy wakes in 1.5-2.2us at p50 and up to 1ms at p99; `BusySpinWaitStrategy` wakes in a few hundred
-nanoseconds but costs a core per waiting goroutine. A third option is for the consumer to block (on a futex, a
-channel, or `sync.Cond`) once idle, and for the producer to wake it when it commits into an empty ring.
+### PARTIAL: Producer-triggered wake-up for low latency without a dedicated core
 
-What we are looking for: a design where the producer pays only when a consumer is actually parked (one atomic load of
-a "sleeping" flag on the common path), and where no wake-up can be lost between the consumer's last empty check and
-its parking. Judge it on wake-latency p50/p99 after long gaps against the default, idle CPU against busy-spin, and the
-cost on `Commit` in `bench/compare`. It may belong in a new wait strategy (or need a new hook, since `WaitStrategy`
-has no producer-side signal today).
+- Built: `ParkingWaitStrategy` (`wait_strategy_park.go`). See `FINDINGS.md` sections 6c and 6d.
+- Idle CPU criterion: met for idle, not quite for the one-consumer sparse row. Idle CPU is 13-57x lower than the
+  default (pilot), and 40-44x lower idle on the reserved i9-10850K (section 6d). Sparse is 9.2x lower with one
+  consumer (under 10x) and 12x lower with two.
+- Wake-latency-after-gaps criterion, p99: met on Linux amd64 (section 6d). After a 50us gap Parking's p99 is 60.9us
+  against the default's 1.02ms. The pilot (macOS, where the default has no 1ms tail) did not meet it.
+- Wake-latency-after-gaps criterion, p50: not met, confirmed on Linux amd64. After a 50us gap p50 is 59.7us against
+  the default's 1.8us (pilot: 14.1us against 2.2us). After a 2us gap the i9 does not park yet (457ns, better than the
+  default). A likely reason is that eight `PAUSE`s per spin make the spin phase much longer on Intel than on Apple
+  cores. The run did not time the spin phase.
+- The `Commit` cost is one load of `waiters` plus `fullFence` on amd64 without `-race`. The fence costs about 19-23ns
+  per single-writer `Commit` on the i9 (section 6d), about 70% of Parking's extra cost over BusySpin there (within the fence run: 18.6ns of 26.3ns).
+
+What would settle it:
+
+- The park-to-wake trip: about 60us on Linux amd64 (8-14us on the M4 Pro). Not the deep C-states (section 6d). Find
+  where the time goes (a runtime trace, `go tool trace`, of the parked Listener and the waking Commit), and cut it.
+- A cheaper fence on amd64, or none: for example, a `notify` path that avoids draining the store buffer on every
+  Commit while keeping Dekker's ordering. Measure it against section 6d's fence diagnostic.
+- A time-based spin budget: spin and yield for a fixed time (for example 50-100us) before the park, in place of a
+  fixed count of calls. A gap shorter than the budget then never parks. Measure it with `BenchmarkWakeLatency` and
+  `BenchmarkIdleCPU`, because a longer budget costs idle CPU.
+
+### PARTIAL: Reserved i7-12700K run of the ParkingWaitStrategy rows
+
+The section 6c numbers are a pilot on macOS, Apple M4 Pro, arm64, unreserved, with turbo not controlled. The reserved
+run asked for here (the `bench/suite` baseline step with the Parking rows, and `bench/compare master` for the default
+rows) ran on 2026-11-06 on an i9-10850K (Comet Lake), not on the i7-12700K: `FINDINGS.md` section 6d.
+
+Settled by that run, on Linux amd64:
+
+- Wake p99 after a long gap: reversed, now met (60.9us against the default's 1.02ms).
+- Wake p50 after a long gap: confirmed, not met (59.7us against 1.8us).
+- `BenchmarkParking` throughput: Parking `SP SC/R1` is about 30-38ns against BusySpin's 11-12ns (arm64: 21.5 against
+  16.0ns).
+- The amd64 fence cost: measured. `fullFence` (`LOCK ORQ`) costs about 19-23ns per single-writer `Commit` and
+  9-14ns on the shared sequencer; it does not change wake latency.
+- The default rows: no regression against master (all `~`, one row -5%).
+
+Still open: the same rows on the i7-12700K (Golden Cove), if Golden Cove numbers are wanted. `bench/suite` now
+selects the Parking rows in its baseline step, and `bench/compare` takes the CPU options.
 
 ### TODO: Busy-spin's cost on the shared sequencer with one writer
 
@@ -154,8 +191,8 @@ Everything adopted since 2026-09-26 was measured only on the i7-12700K: the rele
 `Load`, and `BusySpinWaitStrategy`. The earlier Performance Findings came from the Threadripper 3970X (Zen 2), where
 `XCHG` was 51-58% of single-writer cycles, so the release store should help at least as much there. What we are
 looking for: `bench/compare` against the commit before each change, and `bench/suite baseline`, on the Threadripper.
-Both scripts currently hard-code the i7-12700K's CPU layout: `bench/suite` accepts the CPU options, but
-`bench/compare` needs them added first. Multi-producer rows there are ±10-25% across CCXs, so only large, replicated
+Both scripts default to the i7-12700K's CPU layout, and both accept the CPU options (`bench/compare` since
+`2f73384`). Multi-producer rows there are ±10-25% across CCXs, so only large, replicated
 deltas count.
 
 ### TODO: Pin benchmark producers and consumers to chosen cores
