@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Runs every chanvsring row once per round, in a new shuffled order each round, one process per run, each pinned with
+# taskset to the first producers+2 CPUs of --cpu-order (the producers, the consumer, and one CPU for the runtime).
+# bench/interleave runs test binaries; this tool is a command, so this script does the same job for it.
+#
+# Usage (reserved, as on appa):
+#   sudo bench/reserve --cpus 0-7,10-17 --housekeeping 8,9,18,19 -- \
+#     bench/chanvsring/rounds --binary ./chanvsring --output /tmp/cvr --rounds 5 --cpu-order 0,1,2,3,4,5,6,7
+#
+#   --binary PATH          the chanvsring binary (build it first; nothing compiles during the runs)
+#   --output DIR           results.txt (one benchmark line per run), errors.txt, environment.txt, summary.tsv
+#   --rounds N             rounds (default 5)
+#   --cpu-order LIST       CPUs, one thread per physical core, in the order they are given to runs (default 0-7)
+#   --producers LIST       producer counts (default "1 2 4 6")
+#   --rates LIST           paced rates in messages per second (default "1000000 5000000 10000000 20000000 40000000")
+#   --flat-only            skip the paced rows
+#   --warmup D --duration D  passed to every run (default 1s and 3s)
+#   --label TEXT           written to environment.txt (for example the revision and the reservation)
+
+readonly _msr_prefetch="$(cd "$(dirname "${0}")/.." && pwd)/msr-prefetch"
+_binary=""
+_output=""
+_rounds=5
+_cpu_order="0,1,2,3,4,5,6,7"
+_producers="1 2 4 6"
+_rates="1000000 5000000 10000000 20000000 40000000"
+_flat_only=0
+_warmup="1s"
+_duration="3s"
+_label=""
+
+_main() {
+	_parse_arguments "$@"
+	test -x "${_binary}" || _fail "Binary [${_binary}] is not executable."
+	test -n "${_output}" || _fail "Missing --output."
+	mkdir -p "${_output}"
+	touch "${_output}/results.txt" "${_output}/errors.txt"
+	_record_environment > "${_output}/environment.txt"
+	local _round _spec _count=0
+	for _round in $(seq "${_rounds}"); do
+		while read -r _spec; do
+			_count=$((_count + 1))
+			_log_info "Round [${_round}/${_rounds}] run [${_spec}]..."
+			_run ${_spec}
+		done < <(_specs | shuf)
+	done
+	"${_binary}" summarize "${_output}/results.txt" > "${_output}/summary.tsv"
+	_owns_output
+	_log_info "${_count} runs, $(wc -l < "${_output}/errors.txt") error lines; results in [${_output}]."
+}
+
+# One line per row: producers implementation message batch rate.
+_specs() {
+	local _p _impl _msg _rate
+	for _p in ${_producers}; do
+		for _msg in int64 raw; do
+			echo "${_p} channel ${_msg} 1 0"
+			for _impl in parking busyspin; do
+				echo "${_p} ${_impl} ${_msg} 1 0"
+				echo "${_p} ${_impl} ${_msg} 16 0"
+			done
+			test "${_flat_only}" -eq 1 && continue
+			for _rate in ${_rates}; do
+				for _impl in channel parking busyspin; do
+					echo "${_p} ${_impl} ${_msg} 1 ${_rate}"
+				done
+			done
+		done
+	done
+}
+
+_run() {
+	local _p="${1}" _impl="${2}" _msg="${3}" _batch="${4}" _rate="${5}" _cpus
+	_cpus="$(echo "${_cpu_order}" | cut -d, -f1-$((_p + 2)))"
+	timeout 60 taskset -c "${_cpus}" "${_binary}" -impl "${_impl}" -msg "${_msg}" -producers "${_p}" \
+		-batch "${_batch}" -rate "${_rate}" -warmup "${_warmup}" -duration "${_duration}" \
+		>> "${_output}/results.txt" 2>> "${_output}/errors.txt" ||
+		echo "exit $? for [$*] on CPUs [${_cpus}]" >> "${_output}/errors.txt"
+}
+
+_record_environment() {
+	echo "date: $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+	echo "host: $(uname -n)"
+	echo "cpu: $(lscpu | sed -n 's/^Model name: *//p')"
+	echo "kernel: $(uname -r)"
+	echo "turbo: $(_turbo_state)"
+	echo "governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
+	echo "affinity of this script: $(taskset -cp $$ | sed 's/.*: //')"
+	test "$(id -u)" -eq 0 && grep -q GenuineIntel /proc/cpuinfo && test -e /dev/cpu/0/msr &&
+		echo "msr 0x1a4: $("${_msr_prefetch}" --cpus "$(cat /sys/devices/system/cpu/online)" get | tr '\n' ' ')"
+	echo "binary: ${_binary} sha256 $(sha256sum "${_binary}" | cut -d' ' -f1)"
+	echo "label: ${_label}"
+	echo "rounds: ${_rounds}; cpu order: ${_cpu_order}; producers: ${_producers}; rates: ${_rates}"
+	echo "flat only: ${_flat_only}; warm-up: ${_warmup}; duration: ${_duration}"
+}
+
+_turbo_state() {
+	local _intel="/sys/devices/system/cpu/intel_pstate/no_turbo" _amd="/sys/devices/system/cpu/cpufreq/boost"
+	test -r "${_intel}" && { test "$(cat "${_intel}")" = 1 && echo off || echo on; } && return 0
+	test -r "${_amd}" && { test "$(cat "${_amd}")" = 0 && echo off || echo on; } && return 0
+	echo unknown
+}
+
+_parse_arguments() {
+	while test "$#" -gt 0; do
+		case "${1}" in
+		--binary) _binary="${2}"; shift 2 ;;
+		--output) _output="${2}"; shift 2 ;;
+		--rounds) _rounds="${2}"; shift 2 ;;
+		--cpu-order) _cpu_order="${2}"; shift 2 ;;
+		--producers) _producers="${2}"; shift 2 ;;
+		--rates) _rates="${2}"; shift 2 ;;
+		--flat-only) _flat_only=1; shift ;;
+		--warmup) _warmup="${2}"; shift 2 ;;
+		--duration) _duration="${2}"; shift 2 ;;
+		--label) _label="${2}"; shift 2 ;;
+		*) _fail "Unknown argument [${1}]." ;;
+		esac
+	done
+}
+
+_owns_output() {
+	test "$(id -u)" -eq 0 && test -n "${SUDO_USER:-}" && chown -R "${SUDO_USER}:" "${_output}"
+	return 0
+}
+
+_fail() { _log_error "${1}"; exit 1; }
+
+_log_info()  { _log "[INFO] ${1}"; }
+_log_error() { _log "[ERROR] ${1}"; }
+_log()       { echo "$(date -u '+%Y-%m-%d %H:%M:%SZ') ${1}" >&2; }
+
+_main "$@"
