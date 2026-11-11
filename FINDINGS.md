@@ -683,6 +683,441 @@ single-producer rows.
 - Setup dominates short `perf stat` runs (100ms start-up sleep, scheduler warm-up, allocation): subtract a
   `-test.benchtime 1x` run.
 
+## 8. A Go buffered channel against go-disruptor, the hand-off alone (`bench/chanvsring`, appa)
+
+The question: how many messages per second does go-disruptor hand from producers to one consumer, flat out and at a
+set rate, against a Go buffered channel? This section measures the hand-off alone: no Auditor, no I/O.
+
+**Tool.** `bench/chanvsring` (commit `0d67a71`). P producer goroutines write one message each into a channel or a
+ring slot; one consumer reads every field of it and checks each producer's sequence (a lost, repeated or reordered
+message counts as an error, and a checksum covers every field). Both sides do the same work per message, and no other
+work.
+
+- Messages: `int64`, and `raw`, a 224-byte struct with the field types and order of vpc-auditor's `contracts.Raw`
+  (ring B's slot; `unsafe.Sizeof` is 224 at vpc-auditor `0335a63`, not the 232 of the brief).
+- Contestants, all with 16,384 slots: `chan T` of capacity 16,384; go-disruptor with `ParkingWaitStrategy{}` (the
+  defaults, as ring B uses it); go-disruptor with `BusySpinWaitStrategy`. One producer uses the single-writer
+  sequencer (`WriterCount(1)`, as ring A); 2 to 6 producers use the shared sequencer (`WriterCount(P)`, as ring B).
+  Reserve takes 1 slot; a second go-disruptor row reserves 16, flat out only.
+- Flat out: the producers send as fast as they can. Paced: 1M, 5M, 10M, 20M and 40M msg/s in total, split evenly,
+  on an absolute schedule (cmd/ringload's `due = elapsed x rate`; a late producer sends what is due at once, and never
+  skips). A producer that is ahead of its schedule spins on the clock, so each message leaves at its scheduled time.
+- Latency: one message in 64 per producer carries its send time (flat out: the clock; paced: the scheduled time, so a
+  stall cannot hide its delay). The consumer reads the clock for those messages only. Log-linear histogram, at most
+  0.8% high.
+- "Kept up": the received rate in the window is at least 99% of the offered rate, and at the end of the window at
+  most 16,384 messages (one ring) are due but not received.
+- CPU: the whole process from `getrusage` over the window ("cores"), and a CPU profile with goroutine labels split
+  into producers, consumer, and "runtime" (samples without a label: the scheduler, GC, idle threads). On Linux the
+  three add up to the `getrusage` figure within 0.1 core.
+- One process per run: 1 s warm-up, then a 3 s window. Each run prints one benchstat line.
+- Tests: the schedule (fake clock), the histogram's percentiles, exactly-once delivery for every contestant, message
+  and shape (counts, per-producer order and the checksum, flat out and paced), no goroutine left after a run, and the
+  CPU-profile split. `go test -race` passes; the run tests skip under `-short` (each run takes about 200 ms).
+
+**Machine and method.** appa, as section 6d: Intel i9-10850K, Debian 13, kernel 6.12.115, Go 1.27.1, governor
+`performance`, MSR `0x1a4` = `0x0` on all 20 CPUs.
+
+| Item        | Value                                                                                                  |
+|-------------|--------------------------------------------------------------------------------------------------------|
+| Reservation | `bench/reserve --cpus 0-7,10-17 --housekeeping 8,9,18,19`, turbo off                                    |
+| Pinning     | `taskset` to the first P+2 of CPUs 0 to 7 (one thread per physical core): P producers, the consumer,     |
+|             | and one CPU for the runtime; GOMAXPROCS is Go's default (P+2)                                          |
+| Shapes      | P = 1, 2, 4 and 6. P = 8 needs 10 cores with this rule; the reservation has 8, so P = 6 is the largest  |
+| Rounds      | `bench/chanvsring/rounds`: 160 rows per round, in a new shuffled order each round, 5 rounds (800 runs) |
+| Date        | 2026-11-11, 17:32 to 18:33 UTC; binary sha256 `3ee5bdbe...`                                             |
+
+```bash
+sudo bench/reserve --cpus 0-7,10-17 --housekeeping 8,9,18,19 -- \
+	bench/chanvsring/rounds --binary ./chanvsring --output /tmp/cvr-reserved --rounds 5 --cpu-order 0,1,2,3,4,5,6,7
+```
+
+`bench/interleave` runs test binaries; this tool is a command, so `rounds` does the same job for it. `benchstat`
+needs 6 samples for a confidence interval, so these 5-round medians have none. In `benchstat`, every flat-out
+difference below is p=0.008 (n=5), except channel against Parking at P = 1 (p=0.222) and P = 2 (p=0.730), which are
+`~`. The per-run spread of the flat-out rows is small (for example channel `int64` P=1: 13.1 to 13.8M; Parking: 13.1 to
+19.2M, the widest).
+
+The lab's processes ran during the runs (us-street idle, Kafka, two Alloy agents). Before the runs, no process used
+more than 0.01 core (`top`, 10 s). `bench/reserve` moved `system.slice`, `user.slice` and `init.scope` to the
+housekeeping CPUs. It does not move `nomad.slice`: the Nomad allocations' own processes (us-street) kept CPUs 0 to 19.
+They were idle. After the run, turbo, `AllowedCPUs=` (empty on all three units), the user manager's affinity (0-19)
+and MSR `0x1a4` (`0x0`) were back to their first state, with no process left in `bench.slice`.
+
+**Headline per shape (reserved, medians of 5 runs).** Flat out: received msg/s with Reserve(1). Paced: the highest
+offered rate kept up in at least 3 of 5 runs, with every lower rate kept up too. Latency at 5M msg/s: p50 / p99 from
+the scheduled time.
+
+| Message | P | Flat out: channel / Parking / BusySpin | Disruptor vs channel | Kept up: channel / Parking / BusySpin | p50 / p99 at 5M: channel | Parking | BusySpin |
+|---------|---|----------------------------------------|----------------------|---------------------------------------|---------------------------|---------|----------|
+| int64   | 1 | 13.7M / 14.8M / 24.1M | 1.08x / 1.76x | 10M / 10M / 20M | 35.8 / 70.7 us   | 341 / 587 ns | 313 / 563 ns |
+| int64   | 2 | 13.0M / 12.9M / 15.2M | 1.00x / 1.17x | 10M / 10M / 10M | 40.7 / 80.9 us   | 445 / 667 ns | 441 / 659 ns |
+| int64   | 4 | 12.4M / 18.2M / 25.3M | 1.47x / 2.05x | 10M / 10M / 20M | 56.3 / 137.2 us  | 437 / 687 ns | 441 / 683 ns |
+| int64   | 6 | 11.8M / 19.7M / 29.6M | 1.67x / 2.51x | 5M / 20M / 20M  | 78.3 us / 1.24 ms | 441 / 691 ns | 447 / 695 ns |
+| raw     | 1 | 7.5M / 12.6M / 20.1M  | 1.68x / 2.68x | 5M / 10M / 20M  | 39.7 / 77.3 us   | 407 / 651 ns | 415 / 643 ns |
+| raw     | 2 | 7.7M / 11.6M / 14.2M  | 1.51x / 1.85x | 5M / 10M / 10M  | 81.9 us / 2.49 ms | 429 / 707 ns | 435 / 735 ns |
+| raw     | 4 | 7.0M / 17.8M / 21.7M  | 2.53x / 3.09x | 1M / 10M / 10M  | 3.24 / 3.42 ms (kept 2/5) | 435 / 711 ns | 437 / 691 ns |
+| raw     | 6 | 6.9M / 18.6M / 25.6M  | 2.70x / 3.73x | 5M / 10M / 20M  | 2.69 / 3.52 ms   | 457 / 763 ns | 451 / 739 ns |
+
+- **Throughput.** With one producer and `int64`, Parking ties the channel (1.08x, not significant); BusySpin is 1.76x.
+  With the 224-byte message, or with 4 or 6 producers, go-disruptor is 1.47x to 2.70x the channel with Parking and
+  1.85x to 3.73x with BusySpin. The channel gets slower as producers are added (13.7M to 11.8M for `int64`); go-disruptor
+  gets faster from 2 to 6 producers. With two producers on the shared sequencer, go-disruptor is at its slowest (12.9M
+  and 15.2M), below one producer; this replicated in all 5 rounds and is not explained here.
+- **Batching.** Reserve(16) gives 86M to 153M `int64` msg/s and 30M to 68M `raw` msg/s: 1.6x to 7.9x Reserve(1). A
+  channel has no equivalent.
+- **At a set rate.** go-disruptor keeps up with 10M msg/s in every shape, and BusySpin with 20M in 5 of 8. The channel
+  keeps up with 5M to 10M (`int64`) and 1M to 5M (`raw`).
+- **Latency.** At 1M and 5M msg/s, go-disruptor's p50 is 0.3 to 0.5 us and its p99 0.6 to 0.8 us. The channel's p50
+  is 30 to 34 us at 1M and 36 us to 3.2 ms at 5M; its p99 is 61 to 586 us at 1M and 71 us to 3.5 ms at 5M. Parking and BusySpin do not differ at these rates (see the
+  CPU note below).
+- **CPU.** A go-disruptor consumer uses one whole core at every paced rate here, with either wait strategy. The channel
+  consumer blocks between messages: consumer plus runtime use 0.11 to 0.24 cores at 1M msg/s and 0.30 to 0.76 at 5M.
+
+**Why Parking costs as much as BusySpin here.** Parking spins 64 times (8 `PAUSE`s each) and yields 16 times before it
+parks; section 6d estimates that phase at tens of microseconds on this CPU. At 1M msg/s a message arrives every
+microsecond, so the consumer never reaches the park. Parking saves CPU only when the gaps are longer than the spin
+phase: idle or sparse traffic (section 6d: 0.017 cores idle). These runs do not include such a rate.
+
+**Why the paced channel's p50 is about 30 us even at 1M msg/s.** The consumer blocks on an empty channel. A send
+makes it runnable on the producer's P, but the producer keeps running (it spins on the clock), so an idle P must steal
+the consumer (the Go scheduler waits about 3 us before it steals a P's next goroutine while that P runs) and wake a
+thread. A producer that blocked or slept between sends would let the consumer run sooner. The spin pacing is part of
+this result, and so is the rule that a woken channel receiver waits for a scheduler thread. go-disruptor's consumer
+never blocks, so it does not pay this.
+
+**Producer cores are the pacing spin.** A paced producer spins on the clock until its next message is due, so each
+producer shows about 1 core at every rate. Channel producers show less when they block on a full channel. Compare the
+consumer and runtime columns, not "cores", for the cost of the hand-off.
+
+**Flat-out latency is queue length.** Flat out, the channel is mostly full: its p50 is up to 16,384 / rate (0.14 to
+2.4 ms). go-disruptor at Reserve(1) stays near empty (sub-microsecond latency), because its consumer is faster than its
+producers. At Reserve(16) with 4 or 6 producers, the ring fills, and the latency is 60 to 190 us.
+
+**What this does not measure.** The whole Auditor (parsing, the assembler, the replay log, Kafka), any I/O, more than
+one consumer or handler group, P = 8, other capacities, and rates below 1M msg/s, where Parking parks. The `raw`
+message carries pointers (a slice, strings, an interface) set to shared values; nothing is allocated per message, so
+the GC hardly runs.
+
+**Every table (reserved).** "runtime" is CPU without a goroutine label. "most behind" is the most messages one producer
+was behind its schedule inside the window.
+
+**Flat out, msg=int64: received msg/s (median).**
+
+| P | channel | parking | busyspin | parking/channel | busyspin/channel | parking R16 | busyspin R16 |
+|---|---|---|---|---|---|---|---|
+| 1 | 13.7M | 14.8M | 24.1M | 1.08x | 1.76x | 99.9M | 116.9M |
+| 2 | 13.0M | 12.9M | 15.2M | 1.00x | 1.17x | 86.1M | 114.6M |
+| 4 | 12.4M | 18.2M | 25.3M | 1.47x | 2.05x | 144.0M | 152.7M |
+| 6 | 11.8M | 19.7M | 29.6M | 1.67x | 2.51x | 150.9M | 153.2M |
+
+**Flat out, msg=int64: CPU cores (total / producers / consumer / runtime) and latency p50 / p99.**
+
+| P | contestant | cores | producers | consumer | runtime | p50 | p99 |
+|---|---|---|---|---|---|---|---|
+| 1 | channel | 1.95 | 0.96 | 0.98 | 0.00 | 548.9 us | 1.16 ms |
+| 1 | parking | 2.00 | 0.99 | 0.99 | 0.00 | 202 ns | 555 ns |
+| 1 | busyspin | 2.00 | 0.99 | 0.99 | 0.00 | 265 ns | 495 ns |
+| 1 | parking R16 | 2.00 | 0.99 | 0.99 | 0.00 | 333 ns | 683 ns |
+| 1 | busyspin R16 | 2.00 | 0.99 | 0.99 | 0.00 | 385 ns | 759 ns |
+| 2 | channel | 2.02 | 1.11 | 0.87 | 0.04 | 1.20 ms | 1.28 ms |
+| 2 | parking | 3.00 | 1.99 | 1.00 | 0.00 | 313 ns | 695 ns |
+| 2 | busyspin | 3.00 | 1.99 | 0.99 | 0.00 | 353 ns | 763 ns |
+| 2 | parking R16 | 3.00 | 2.00 | 0.99 | 0.00 | 619 ns | 1.0 us |
+| 2 | busyspin R16 | 3.00 | 1.99 | 0.99 | 0.00 | 891 ns | 1.4 us |
+| 4 | channel | 2.03 | 1.09 | 0.78 | 0.08 | 1.28 ms | 1.35 ms |
+| 4 | parking | 5.00 | 3.98 | 1.00 | 0.00 | 415 ns | 771 ns |
+| 4 | busyspin | 5.00 | 3.99 | 0.99 | 0.00 | 501 ns | 787 ns |
+| 4 | parking R16 | 4.99 | 3.97 | 0.99 | 0.00 | 63.7 us | 75.8 us |
+| 4 | busyspin R16 | 5.00 | 3.99 | 1.00 | 0.00 | 62.2 us | 74.2 us |
+| 6 | channel | 2.06 | 1.11 | 0.72 | 0.12 | 1.36 ms | 1.43 ms |
+| 6 | parking | 7.00 | 5.97 | 1.00 | 0.00 | 507 ns | 1.0 us |
+| 6 | busyspin | 6.98 | 5.94 | 0.99 | 0.00 | 607 ns | 1.0 us |
+| 6 | parking R16 | 6.98 | 5.95 | 0.99 | 0.00 | 60.9 us | 71.7 us |
+| 6 | busyspin R16 | 7.00 | 5.97 | 0.99 | 0.00 | 63.0 us | 73.7 us |
+
+**Flat out, msg=raw: received msg/s (median).**
+
+| P | channel | parking | busyspin | parking/channel | busyspin/channel | parking R16 | busyspin R16 |
+|---|---|---|---|---|---|---|---|
+| 1 | 7.5M | 12.6M | 20.1M | 1.68x | 2.68x | 30.0M | 32.2M |
+| 2 | 7.7M | 11.6M | 14.2M | 1.51x | 1.85x | 30.5M | 30.7M |
+| 4 | 7.0M | 17.8M | 21.7M | 2.53x | 3.09x | 68.2M | 63.0M |
+| 6 | 6.9M | 18.6M | 25.6M | 2.70x | 3.73x | 65.0M | 64.8M |
+
+**Flat out, msg=raw: CPU cores (total / producers / consumer / runtime) and latency p50 / p99.**
+
+| P | contestant | cores | producers | consumer | runtime | p50 | p99 |
+|---|---|---|---|---|---|---|---|
+| 1 | channel | 1.98 | 0.99 | 0.98 | 0.00 | 136.2 us | 892.9 us |
+| 1 | parking | 2.00 | 0.99 | 1.00 | 0.00 | 337 ns | 643 ns |
+| 1 | busyspin | 2.00 | 0.99 | 1.00 | 0.00 | 375 ns | 691 ns |
+| 1 | parking R16 | 2.00 | 0.99 | 1.00 | 0.00 | 831 ns | 1.2 us |
+| 1 | busyspin R16 | 2.00 | 0.99 | 1.00 | 0.00 | 803 ns | 1.1 us |
+| 2 | channel | 2.03 | 1.11 | 0.83 | 0.03 | 2.06 ms | 2.18 ms |
+| 2 | parking | 3.00 | 1.99 | 1.00 | 0.00 | 375 ns | 787 ns |
+| 2 | busyspin | 3.00 | 1.99 | 0.99 | 0.00 | 411 ns | 863 ns |
+| 2 | parking R16 | 3.00 | 1.99 | 0.99 | 0.00 | 1.5 us | 2.2 us |
+| 2 | busyspin R16 | 3.00 | 1.99 | 1.00 | 0.00 | 1.7 us | 2.3 us |
+| 4 | channel | 2.13 | 1.28 | 0.71 | 0.06 | 2.28 ms | 2.38 ms |
+| 4 | parking | 5.00 | 3.98 | 1.00 | 0.00 | 417 ns | 855 ns |
+| 4 | busyspin | 5.00 | 3.98 | 1.00 | 0.00 | 527 ns | 931 ns |
+| 4 | parking R16 | 4.99 | 3.97 | 1.00 | 0.00 | 89.6 us | 133.1 us |
+| 4 | busyspin R16 | 5.00 | 3.98 | 1.00 | 0.00 | 60.7 us | 123.4 us |
+| 6 | channel | 2.09 | 1.16 | 0.71 | 0.11 | 2.34 ms | 2.44 ms |
+| 6 | parking | 7.00 | 5.97 | 1.00 | 0.00 | 543 ns | 1.1 us |
+| 6 | busyspin | 7.00 | 5.98 | 1.00 | 0.00 | 743 ns | 1.2 us |
+| 6 | parking R16 | 6.46 | 5.26 | 0.97 | 0.20 | 129.0 us | 189.4 us |
+| 6 | busyspin R16 | 7.00 | 5.97 | 1.00 | 0.00 | 130.0 us | 156.7 us |
+
+**At a shared rate.** Cores are consumer plus runtime / the whole process (the rest is the producers' pacing spin).
+
+**At 1M msg/s, msg=int64: consumer+runtime cores / all cores, and p50 / p99 / p999 from the scheduled time.**
+
+| P | channel cores | parking cores | busyspin cores | channel p50 / p99 / p999 | parking p50 / p99 / p999 | busyspin p50 / p99 / p999 |
+|---|---|---|---|---|---|---|
+| 1 | 0.11 / 1.14 | 0.99 / 2.00 | 0.99 / 2.00 | 31.7 us / 585.7 us / 3.18 ms | 373 ns / 579 ns / 67.1 us | 349 ns / 587 ns / 19.1 us |
+| 2 | 0.14 / 2.14 | 1.00 / 3.00 | 0.99 / 3.00 | 31.0 us / 62.7 us / 2.42 ms | 409 ns / 615 ns / 855 ns | 411 ns / 623 ns / 5.1 us |
+| 4 | 0.13 / 4.13 | 1.00 / 5.00 | 0.99 / 5.00 | 29.9 us / 60.9 us / 1.95 ms | 421 ns / 615 ns / 711 ns | 419 ns / 623 ns / 843 ns |
+| 6 | 0.12 / 6.13 | 1.00 / 7.00 | 0.99 / 7.00 | 29.9 us / 60.7 us / 782.3 us | 421 ns / 623 ns / 5.9 us | 423 ns / 611 ns / 2.5 us |
+
+**At 1M msg/s, msg=raw: consumer+runtime cores / all cores, and p50 / p99 / p999 from the scheduled time.**
+
+| P | channel cores | parking cores | busyspin cores | channel p50 / p99 / p999 | parking p50 / p99 / p999 | busyspin p50 / p99 / p999 |
+|---|---|---|---|---|---|---|
+| 1 | 0.16 / 1.19 | 0.99 / 2.00 | 0.99 / 2.00 | 34.0 us / 65.0 us / 2.62 ms | 403 ns / 631 ns / 32.0 us | 401 ns / 607 ns / 667 ns |
+| 2 | 0.18 / 2.18 | 0.99 / 3.00 | 1.00 / 3.00 | 32.3 us / 63.7 us / 1.29 ms | 443 ns / 635 ns / 1.8 us | 421 ns / 635 ns / 2.0 us |
+| 4 | 0.20 / 4.20 | 1.00 / 5.00 | 1.00 / 5.00 | 30.9 us / 63.2 us / 1.24 ms | 423 ns / 623 ns / 3.6 us | 427 ns / 635 ns / 2.2 us |
+| 6 | 0.24 / 6.05 | 1.00 / 7.00 | 0.99 / 7.00 | 33.3 us / 68.1 us / 1.52 ms | 429 ns / 639 ns / 6.9 us | 435 ns / 631 ns / 7.6 us |
+
+**At 5M msg/s, msg=int64: consumer+runtime cores / all cores, and p50 / p99 / p999 from the scheduled time.**
+
+| P | channel cores | parking cores | busyspin cores | channel p50 / p99 / p999 | parking p50 / p99 / p999 | busyspin p50 / p99 / p999 |
+|---|---|---|---|---|---|---|
+| 1 | 0.30 / 1.34 | 0.99 / 2.00 | 1.00 / 2.00 | 35.8 us / 70.7 us / 757.8 us | 341 ns / 587 ns / 40.2 us | 313 ns / 563 ns / 24.1 us |
+| 2 | 0.36 / 2.23 | 1.00 / 3.00 | 1.00 / 3.00 | 40.7 us / 80.9 us / 1.24 ms | 445 ns / 667 ns / 6.7 us | 441 ns / 659 ns / 4.5 us |
+| 4 | 0.48 / 3.26 | 1.00 / 5.00 | 1.00 / 5.00 | 56.3 us / 137.2 us / 966.7 us | 437 ns / 687 ns / 6.5 us | 441 ns / 683 ns / 5.5 us |
+| 6 | 0.46 / 3.67 | 0.99 / 6.99 | 1.00 / 7.00 | 78.3 us / 1.24 ms / 5.14 ms | 441 ns / 691 ns / 8.0 us | 447 ns / 695 ns / 8.2 us |
+
+**At 5M msg/s, msg=raw: consumer+runtime cores / all cores, and p50 / p99 / p999 from the scheduled time.**
+
+| P | channel cores | parking cores | busyspin cores | channel p50 / p99 / p999 | parking p50 / p99 / p999 | busyspin p50 / p99 / p999 |
+|---|---|---|---|---|---|---|
+| 1 | 0.60 / 1.61 | 1.00 / 2.00 | 0.99 / 2.00 | 39.7 us / 77.3 us / 159.7 us | 407 ns / 651 ns / 7.4 us | 415 ns / 643 ns / 7.1 us |
+| 2 | 0.76 / 2.38 | 1.00 / 3.00 | 0.99 / 3.00 | 81.9 us / 2.49 ms / 3.34 ms | 429 ns / 707 ns / 4.6 us | 435 ns / 735 ns / 9.2 us |
+| 4 | 0.73 / 2.68 | 1.00 / 5.00 | 1.00 / 5.00 | 3.24 ms / 3.42 ms / 3.52 ms (kept 2/5) | 435 ns / 711 ns / 6.4 us | 437 ns / 691 ns / 4.8 us |
+| 6 | 0.66 / 2.59 | 1.00 / 7.00 | 0.99 / 6.99 | 2.69 ms / 3.52 ms / 4.36 ms | 457 ns / 763 ns / 8.9 us | 451 ns / 739 ns / 8.2 us |
+
+
+**Paced, msg=int64: highest offered rate kept up (kept in at least 3 of 5 runs).**
+
+| P | channel | parking | busyspin |
+|---|---|---|---|
+| 1 | 10M | 10M | 20M |
+| 2 | 10M | 10M | 10M |
+| 4 | 10M | 10M | 20M |
+| 6 | 5M | 20M | 20M |
+
+**Paced, msg=int64: every row (median of the runs; latency from the scheduled time).**
+
+| P | rate | contestant | achieved | kept | cores | consumer | runtime | cores per 1M/s | p50 | p99 | p999 | most behind |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1M | channel | 1.0M | 5/5 | 1.14 | 0.04 | 0.07 | 1.144 | 31.7 us | 585.7 us | 3.18 ms | 300 |
+| 1 | 1M | parking | 1.0M | 5/5 | 2.00 | 0.99 | 0.00 | 2.001 | 373 ns | 579 ns | 67.1 us | 236 |
+| 1 | 1M | busyspin | 1.0M | 5/5 | 2.00 | 0.99 | 0.00 | 1.999 | 349 ns | 587 ns | 19.1 us | 302 |
+| 1 | 5M | channel | 5.0M | 5/5 | 1.34 | 0.24 | 0.06 | 0.268 | 35.8 us | 70.7 us | 757.8 us | 1426 |
+| 1 | 5M | parking | 5.0M | 5/5 | 2.00 | 0.99 | 0.00 | 0.400 | 341 ns | 587 ns | 40.2 us | 1517 |
+| 1 | 5M | busyspin | 5.0M | 5/5 | 2.00 | 1.00 | 0.00 | 0.400 | 313 ns | 563 ns | 24.1 us | 1390 |
+| 1 | 10M | channel | 10.0M | 5/5 | 1.68 | 0.64 | 0.02 | 0.168 | 41.0 us | 79.9 us | 223.2 us | 3050 |
+| 1 | 10M | parking | 10.0M | 5/5 | 2.00 | 1.00 | 0.00 | 0.200 | 285 ns | 663 ns | 25.2 us | 2123 |
+| 1 | 10M | busyspin | 10.0M | 5/5 | 2.00 | 0.99 | 0.00 | 0.200 | 259 ns | 639 ns | 65.3 us | 3009 |
+| 1 | 20M | channel | 13.6M | 0/5 | 1.96 | 0.98 | 0.01 | 0.142 | 796.90 ms | 1.27 s | 1.27 s | 25410000 |
+| 1 | 20M | parking | 14.3M | 0/5 | 2.00 | 1.00 | 0.00 | 0.140 | 362.80 ms | 885.00 ms | 893.40 ms | 17880000 |
+| 1 | 20M | busyspin | 20.0M | 5/5 | 2.00 | 0.99 | 0.00 | 0.100 | 551 ns | 1.8 us | 132.1 us | 6168 |
+| 1 | 40M | channel | 13.7M | 0/5 | 1.96 | 0.98 | 0.00 | 0.143 | 1.64 s | 2.62 s | 2.63 s | 105300000 |
+| 1 | 40M | parking | 15.2M | 0/5 | 2.00 | 0.99 | 0.00 | 0.132 | 1.51 s | 2.47 s | 2.48 s | 99090000 |
+| 1 | 40M | busyspin | 38.9M | 2/5 | 2.00 | 0.99 | 0.00 | 0.051 | 62.91 ms | 112.20 ms | 113.80 ms | 4551000 |
+| 2 | 1M | channel | 1.0M | 5/5 | 2.14 | 0.06 | 0.08 | 2.142 | 31.0 us | 62.7 us | 2.42 ms | 147 |
+| 2 | 1M | parking | 1.0M | 5/5 | 3.00 | 1.00 | 0.00 | 3.003 | 409 ns | 615 ns | 855 ns | 149 |
+| 2 | 1M | busyspin | 1.0M | 5/5 | 3.00 | 0.99 | 0.00 | 3.001 | 411 ns | 623 ns | 5.1 us | 125 |
+| 2 | 5M | channel | 5.0M | 5/5 | 2.23 | 0.30 | 0.05 | 0.445 | 40.7 us | 80.9 us | 1.24 ms | 577 |
+| 2 | 5M | parking | 5.0M | 5/5 | 3.00 | 1.00 | 0.00 | 0.600 | 445 ns | 667 ns | 6.7 us | 736 |
+| 2 | 5M | busyspin | 5.0M | 5/5 | 3.00 | 1.00 | 0.00 | 0.601 | 441 ns | 659 ns | 4.5 us | 537 |
+| 2 | 10M | channel | 10.0M | 5/5 | 2.32 | 0.75 | 0.02 | 0.232 | 74.2 us | 185.3 us | 1.03 ms | 8762 |
+| 2 | 10M | parking | 10.0M | 5/5 | 3.00 | 1.00 | 0.00 | 0.300 | 471 ns | 879 ns | 24.3 us | 1448 |
+| 2 | 10M | busyspin | 10.0M | 5/5 | 3.00 | 0.99 | 0.00 | 0.300 | 403 ns | 775 ns | 6.7 us | 1457 |
+| 2 | 20M | channel | 13.2M | 0/5 | 2.03 | 0.87 | 0.02 | 0.153 | 843.10 ms | 1.34 s | 1.36 s | 13600000 |
+| 2 | 20M | parking | 13.2M | 0/5 | 3.00 | 1.00 | 0.00 | 0.227 | 864.00 ms | 1.36 s | 1.38 s | 13720000 |
+| 2 | 20M | busyspin | 14.9M | 0/5 | 3.00 | 1.00 | 0.00 | 0.201 | 541.10 ms | 1.23 s | 1.24 s | 12430000 |
+| 2 | 40M | channel | 13.6M | 0/5 | 2.05 | 0.88 | 0.03 | 0.151 | 1.65 s | 2.62 s | 2.65 s | 52930000 |
+| 2 | 40M | parking | 13.0M | 0/5 | 3.00 | 0.99 | 0.00 | 0.231 | 1.70 s | 2.70 s | 2.73 s | 54610000 |
+| 2 | 40M | busyspin | 15.2M | 0/5 | 3.00 | 0.99 | 0.00 | 0.197 | 1.55 s | 2.55 s | 2.60 s | 51820000 |
+| 4 | 1M | channel | 1.0M | 5/5 | 4.13 | 0.05 | 0.08 | 4.133 | 29.9 us | 60.9 us | 1.95 ms | 70 |
+| 4 | 1M | parking | 1.0M | 5/5 | 5.00 | 1.00 | 0.00 | 5.001 | 421 ns | 615 ns | 711 ns | 54 |
+| 4 | 1M | busyspin | 1.0M | 5/5 | 5.00 | 0.99 | 0.00 | 5.002 | 419 ns | 623 ns | 843 ns | 71 |
+| 4 | 5M | channel | 5.0M | 5/5 | 3.26 | 0.45 | 0.03 | 0.652 | 56.3 us | 137.2 us | 966.7 us | 2361 |
+| 4 | 5M | parking | 5.0M | 5/5 | 5.00 | 1.00 | 0.00 | 1.000 | 437 ns | 687 ns | 6.5 us | 1900 |
+| 4 | 5M | busyspin | 5.0M | 5/5 | 5.00 | 1.00 | 0.00 | 1.000 | 441 ns | 683 ns | 5.5 us | 353 |
+| 4 | 10M | channel | 10.0M | 4/5 | 2.37 | 0.71 | 0.03 | 0.237 | 1.59 ms | 2.05 ms | 2.85 ms | 7822 |
+| 4 | 10M | parking | 10.0M | 5/5 | 5.00 | 0.99 | 0.00 | 0.500 | 439 ns | 747 ns | 7.5 us | 3903 |
+| 4 | 10M | busyspin | 10.0M | 5/5 | 5.00 | 1.00 | 0.00 | 0.500 | 469 ns | 807 ns | 6.6 us | 709 |
+| 4 | 20M | channel | 12.9M | 0/5 | 2.04 | 0.76 | 0.08 | 0.159 | 885.00 ms | 1.42 s | 1.43 s | 7159000 |
+| 4 | 20M | parking | 19.5M | 2/5 | 5.00 | 1.00 | 0.00 | 0.256 | 53.74 ms | 176.20 ms | 180.40 ms | 901800 |
+| 4 | 20M | busyspin | 20.0M | 5/5 | 5.00 | 1.00 | 0.00 | 0.250 | 611 ns | 5.4 us | 181.2 us | 1435 |
+| 4 | 40M | channel | 12.7M | 0/5 | 2.05 | 0.77 | 0.09 | 0.162 | 1.71 s | 2.72 s | 2.75 s | 27410000 |
+| 4 | 40M | parking | 19.7M | 0/5 | 5.00 | 1.00 | 0.00 | 0.253 | 1.27 s | 2.04 s | 2.08 s | 20810000 |
+| 4 | 40M | busyspin | 24.2M | 0/5 | 5.00 | 0.99 | 0.00 | 0.207 | 968.90 ms | 1.68 s | 1.71 s | 17120000 |
+| 6 | 1M | channel | 1.0M | 5/5 | 6.13 | 0.06 | 0.06 | 6.133 | 29.9 us | 60.7 us | 782.3 us | 45 |
+| 6 | 1M | parking | 1.0M | 5/5 | 7.00 | 1.00 | 0.00 | 6.998 | 421 ns | 623 ns | 5.9 us | 46 |
+| 6 | 1M | busyspin | 1.0M | 5/5 | 7.00 | 0.99 | 0.00 | 7.001 | 423 ns | 611 ns | 2.5 us | 46 |
+| 6 | 5M | channel | 5.0M | 5/5 | 3.67 | 0.44 | 0.02 | 0.733 | 78.3 us | 1.24 ms | 5.14 ms | 4693 |
+| 6 | 5M | parking | 5.0M | 5/5 | 6.99 | 0.99 | 0.00 | 1.399 | 441 ns | 691 ns | 8.0 us | 1641 |
+| 6 | 5M | busyspin | 5.0M | 5/5 | 7.00 | 1.00 | 0.00 | 1.400 | 447 ns | 695 ns | 8.2 us | 229 |
+| 6 | 10M | channel | 10.0M | 1/5 | 2.33 | 0.65 | 0.08 | 0.233 | 1.67 ms | 2.09 ms | 2.31 ms | 1894 |
+| 6 | 10M | parking | 10.0M | 5/5 | 7.00 | 1.00 | 0.00 | 0.700 | 485 ns | 827 ns | 7.5 us | 588 |
+| 6 | 10M | busyspin | 10.0M | 5/5 | 7.00 | 0.99 | 0.00 | 0.700 | 465 ns | 831 ns | 10.0 us | 473 |
+| 6 | 20M | channel | 12.2M | 0/5 | 2.06 | 0.73 | 0.10 | 0.169 | 968.90 ms | 1.55 s | 1.59 s | 5318000 |
+| 6 | 20M | parking | 20.0M | 5/5 | 7.00 | 1.00 | 0.00 | 0.350 | 707 ns | 3.0 us | 184.3 us | 1617 |
+| 6 | 20M | busyspin | 20.0M | 5/5 | 7.00 | 1.00 | 0.00 | 0.350 | 691 ns | 1.2 us | 10.9 us | 991 |
+| 6 | 40M | channel | 12.2M | 0/5 | 2.07 | 0.73 | 0.11 | 0.170 | 1.74 s | 2.77 s | 2.79 s | 18610000 |
+| 6 | 40M | parking | 20.4M | 0/5 | 7.00 | 0.99 | 0.00 | 0.343 | 1.23 s | 2.00 s | 2.04 s | 13610000 |
+| 6 | 40M | busyspin | 31.4M | 0/5 | 7.00 | 0.99 | 0.00 | 0.223 | 518.00 ms | 1.04 s | 1.08 s | 7223000 |
+
+**Paced, msg=raw: highest offered rate kept up (kept in at least 3 of 5 runs).**
+
+| P | channel | parking | busyspin |
+|---|---|---|---|
+| 1 | 5M | 10M | 20M |
+| 2 | 5M | 10M | 10M |
+| 4 | 1M | 10M | 10M |
+| 6 | 5M | 10M | 20M |
+
+**Paced, msg=raw: every row (median of the runs; latency from the scheduled time).**
+
+| P | rate | contestant | achieved | kept | cores | consumer | runtime | cores per 1M/s | p50 | p99 | p999 | most behind |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1M | channel | 1.0M | 5/5 | 1.19 | 0.10 | 0.06 | 1.194 | 34.0 us | 65.0 us | 2.62 ms | 240 |
+| 1 | 1M | parking | 1.0M | 5/5 | 2.00 | 0.99 | 0.00 | 2.000 | 403 ns | 631 ns | 32.0 us | 306 |
+| 1 | 1M | busyspin | 1.0M | 5/5 | 2.00 | 0.99 | 0.00 | 2.002 | 401 ns | 607 ns | 667 ns | 47 |
+| 1 | 5M | channel | 5.0M | 5/5 | 1.61 | 0.57 | 0.03 | 0.323 | 39.7 us | 77.3 us | 159.7 us | 1541 |
+| 1 | 5M | parking | 5.0M | 5/5 | 2.00 | 1.00 | 0.00 | 0.400 | 407 ns | 651 ns | 7.4 us | 1165 |
+| 1 | 5M | busyspin | 5.0M | 5/5 | 2.00 | 0.99 | 0.00 | 0.400 | 415 ns | 643 ns | 7.1 us | 1504 |
+| 1 | 10M | channel | 7.6M | 0/5 | 1.95 | 0.95 | 0.00 | 0.256 | 616.60 ms | 968.90 ms | 977.30 ms | 9753000 |
+| 1 | 10M | parking | 10.0M | 5/5 | 2.00 | 1.00 | 0.00 | 0.200 | 491 ns | 939 ns | 64.0 us | 147 |
+| 1 | 10M | busyspin | 10.0M | 5/5 | 2.00 | 1.00 | 0.00 | 0.200 | 375 ns | 767 ns | 5.3 us | 2148 |
+| 1 | 20M | channel | 7.8M | 0/5 | 1.99 | 0.98 | 0.00 | 0.254 | 1.54 s | 2.45 s | 2.47 s | 49080000 |
+| 1 | 20M | parking | 13.9M | 0/5 | 2.00 | 0.99 | 0.00 | 0.143 | 775.90 ms | 1.23 s | 1.23 s | 24580000 |
+| 1 | 20M | busyspin | 20.0M | 5/5 | 2.00 | 0.99 | 0.00 | 0.100 | 3.0 us | 1.29 ms | 2.07 ms | 46580 |
+| 1 | 40M | channel | 7.8M | 0/5 | 1.98 | 0.97 | 0.00 | 0.253 | 2.02 s | 3.20 s | 3.22 s | 128600000 |
+| 1 | 40M | parking | 14.1M | 0/5 | 2.00 | 0.99 | 0.00 | 0.141 | 1.64 s | 2.58 s | 2.60 s | 104000000 |
+| 1 | 40M | busyspin | 20.0M | 0/5 | 2.00 | 1.00 | 0.00 | 0.100 | 1.26 s | 1.99 s | 2.00 s | 79850000 |
+| 2 | 1M | channel | 1.0M | 5/5 | 2.18 | 0.11 | 0.07 | 2.182 | 32.3 us | 63.7 us | 1.29 ms | 114 |
+| 2 | 1M | parking | 1.0M | 5/5 | 3.00 | 0.99 | 0.00 | 3.001 | 443 ns | 635 ns | 1.8 us | 150 |
+| 2 | 1M | busyspin | 1.0M | 5/5 | 3.00 | 1.00 | 0.00 | 3.002 | 421 ns | 635 ns | 2.0 us | 148 |
+| 2 | 5M | channel | 5.0M | 5/5 | 2.38 | 0.76 | 0.01 | 0.475 | 81.9 us | 2.49 ms | 3.34 ms | 5516 |
+| 2 | 5M | parking | 5.0M | 5/5 | 3.00 | 1.00 | 0.00 | 0.600 | 429 ns | 707 ns | 4.6 us | 739 |
+| 2 | 5M | busyspin | 5.0M | 5/5 | 3.00 | 0.99 | 0.00 | 0.600 | 435 ns | 735 ns | 9.2 us | 749 |
+| 2 | 10M | channel | 7.8M | 0/5 | 2.01 | 0.86 | 0.03 | 0.259 | 553.60 ms | 893.40 ms | 906.00 ms | 4528000 |
+| 2 | 10M | parking | 10.0M | 5/5 | 3.00 | 1.00 | 0.00 | 0.300 | 559 ns | 3.33 ms | 5.37 ms | 28210 |
+| 2 | 10M | busyspin | 10.0M | 5/5 | 3.00 | 0.99 | 0.00 | 0.300 | 447 ns | 947 ns | 91.1 us | 1484 |
+| 2 | 20M | channel | 7.8M | 0/5 | 2.01 | 0.85 | 0.03 | 0.259 | 1.53 s | 2.47 s | 2.50 s | 24890000 |
+| 2 | 20M | parking | 11.9M | 0/5 | 3.00 | 0.99 | 0.00 | 0.252 | 985.70 ms | 1.84 s | 1.88 s | 18750000 |
+| 2 | 20M | busyspin | 13.8M | 0/5 | 3.00 | 1.00 | 0.00 | 0.217 | 771.80 ms | 1.43 s | 1.44 s | 14390000 |
+| 2 | 40M | channel | 7.8M | 0/5 | 2.02 | 0.84 | 0.03 | 0.257 | 2.01 s | 3.20 s | 3.24 s | 64680000 |
+| 2 | 40M | parking | 11.8M | 0/5 | 3.00 | 1.00 | 0.00 | 0.255 | 1.78 s | 2.87 s | 2.92 s | 58310000 |
+| 2 | 40M | busyspin | 13.9M | 0/5 | 3.00 | 0.99 | 0.00 | 0.216 | 1.63 s | 2.70 s | 2.73 s | 54780000 |
+| 4 | 1M | channel | 1.0M | 5/5 | 4.20 | 0.14 | 0.06 | 4.202 | 30.9 us | 63.2 us | 1.24 ms | 80 |
+| 4 | 1M | parking | 1.0M | 5/5 | 5.00 | 1.00 | 0.00 | 5.001 | 423 ns | 623 ns | 3.6 us | 73 |
+| 4 | 1M | busyspin | 1.0M | 5/5 | 5.00 | 1.00 | 0.00 | 5.001 | 427 ns | 635 ns | 2.2 us | 70 |
+| 4 | 5M | channel | 5.0M | 2/5 | 2.68 | 0.68 | 0.05 | 0.536 | 3.24 ms | 3.42 ms | 3.52 ms | 707 |
+| 4 | 5M | parking | 5.0M | 5/5 | 5.00 | 1.00 | 0.00 | 1.000 | 435 ns | 711 ns | 6.4 us | 365 |
+| 4 | 5M | busyspin | 5.0M | 5/5 | 5.00 | 1.00 | 0.00 | 1.000 | 437 ns | 691 ns | 4.8 us | 363 |
+| 4 | 10M | channel | 7.0M | 0/5 | 2.13 | 0.72 | 0.07 | 0.305 | 738.20 ms | 1.27 s | 1.30 s | 3259000 |
+| 4 | 10M | parking | 10.0M | 5/5 | 5.00 | 0.99 | 0.00 | 0.500 | 473 ns | 871 ns | 13.3 us | 722 |
+| 4 | 10M | busyspin | 10.0M | 5/5 | 5.00 | 0.99 | 0.00 | 0.500 | 443 ns | 847 ns | 10.1 us | 709 |
+| 4 | 20M | channel | 6.8M | 0/5 | 2.14 | 0.72 | 0.08 | 0.312 | 1.65 s | 2.63 s | 2.68 s | 13440000 |
+| 4 | 20M | parking | 17.2M | 0/5 | 5.00 | 1.00 | 0.00 | 0.291 | 295.70 ms | 725.60 ms | 746.60 ms | 3734000 |
+| 4 | 20M | busyspin | 19.9M | 1/5 | 5.00 | 1.00 | 0.00 | 0.250 | 573.4 us | 91.23 ms | 91.75 ms | 459700 |
+| 4 | 40M | channel | 6.9M | 0/5 | 2.20 | 0.72 | 0.07 | 0.320 | 2.08 s | 3.29 s | 3.32 s | 33200000 |
+| 4 | 40M | parking | 17.6M | 0/5 | 5.00 | 0.99 | 0.00 | 0.284 | 1.39 s | 2.33 s | 2.37 s | 23610000 |
+| 4 | 40M | busyspin | 22.3M | 0/5 | 5.00 | 1.00 | 0.00 | 0.224 | 1.07 s | 2.04 s | 2.11 s | 21090000 |
+| 6 | 1M | channel | 1.0M | 5/5 | 6.05 | 0.19 | 0.05 | 6.054 | 33.3 us | 68.1 us | 1.52 ms | 171 |
+| 6 | 1M | parking | 1.0M | 5/5 | 7.00 | 1.00 | 0.00 | 7.001 | 429 ns | 639 ns | 6.9 us | 46 |
+| 6 | 1M | busyspin | 1.0M | 5/5 | 7.00 | 0.99 | 0.00 | 7.002 | 435 ns | 631 ns | 7.6 us | 46 |
+| 6 | 5M | channel | 5.0M | 3/5 | 2.59 | 0.63 | 0.03 | 0.518 | 2.69 ms | 3.52 ms | 4.36 ms | 2116 |
+| 6 | 5M | parking | 5.0M | 5/5 | 7.00 | 1.00 | 0.00 | 1.400 | 457 ns | 763 ns | 8.9 us | 404 |
+| 6 | 5M | busyspin | 5.0M | 5/5 | 6.99 | 0.99 | 0.00 | 1.399 | 451 ns | 739 ns | 8.2 us | 239 |
+| 6 | 10M | channel | 7.0M | 0/5 | 2.06 | 0.73 | 0.11 | 0.296 | 755.00 ms | 1.32 s | 1.39 s | 2328000 |
+| 6 | 10M | parking | 10.0M | 5/5 | 7.00 | 0.99 | 0.00 | 0.700 | 501 ns | 947 ns | 9.3 us | 778 |
+| 6 | 10M | busyspin | 10.0M | 5/5 | 7.00 | 1.00 | 0.00 | 0.700 | 473 ns | 895 ns | 8.2 us | 457 |
+| 6 | 20M | channel | 7.0M | 0/5 | 2.08 | 0.72 | 0.12 | 0.298 | 1.64 s | 2.60 s | 2.63 s | 8778000 |
+| 6 | 20M | parking | 19.7M | 1/5 | 7.00 | 1.00 | 0.00 | 0.355 | 29.62 ms | 114.80 ms | 116.90 ms | 390100 |
+| 6 | 20M | busyspin | 20.0M | 5/5 | 7.00 | 0.99 | 0.00 | 0.350 | 791 ns | 2.1 us | 42.8 us | 908 |
+| 6 | 40M | channel | 6.9M | 0/5 | 2.07 | 0.75 | 0.12 | 0.299 | 2.07 s | 3.29 s | 3.34 s | 22260000 |
+| 6 | 40M | parking | 19.7M | 0/5 | 7.00 | 0.99 | 0.00 | 0.355 | 1.29 s | 2.06 s | 2.11 s | 14030000 |
+| 6 | 40M | busyspin | 25.8M | 0/5 | 7.00 | 1.00 | 0.00 | 0.272 | 868.20 ms | 1.51 s | 1.58 s | 10540000 |
+
+**Unreserved pass, turbo on (for comparison only).** The same binary and pinning, without `bench/reserve`, turbo on,
+the flat-out rows and the 5M rows, 3 shuffled rounds, 2026-11-11 18:34 to 18:49 UTC. From 18:40 UTC appa's Nomad
+client lost its server over the network (the Mac's ssh to appa failed then too); the last 9 minutes of this pass ran
+during that outage. With turbo, the flat-out rows change by -4% to +77% (most by +25% to +45%). The disruptor-to-channel
+ratios stay within -10% and +17% of the reserved ones, so the verdict does not change.
+**Flat out, msg=int64: received msg/s (median).**
+
+| P | channel | parking | busyspin | parking/channel | busyspin/channel | parking R16 | busyspin R16 |
+|---|---|---|---|---|---|---|---|
+| 1 | 18.1M | 22.9M | 30.7M | 1.27x | 1.70x | 126.2M | 167.0M |
+| 2 | 17.7M | 19.5M | 22.4M | 1.10x | 1.27x | 152.4M | 109.8M |
+| 4 | 16.9M | 27.3M | 33.3M | 1.62x | 1.98x | 194.4M | 204.0M |
+| 6 | 16.2M | 26.6M | 38.7M | 1.64x | 2.38x | 203.4M | 205.7M |
+
+**Flat out, msg=raw: received msg/s (median).**
+
+| P | channel | parking | busyspin | parking/channel | busyspin/channel | parking R16 | busyspin R16 |
+|---|---|---|---|---|---|---|---|
+| 1 | 10.7M | 17.2M | 25.6M | 1.62x | 2.41x | 41.5M | 42.0M |
+| 2 | 10.3M | 15.8M | 18.4M | 1.54x | 1.80x | 41.7M | 40.9M |
+| 4 | 9.5M | 23.5M | 28.7M | 2.48x | 3.04x | 79.6M | 79.8M |
+| 6 | 9.3M | 24.8M | 33.6M | 2.67x | 3.62x | 90.5M | 83.9M |
+
+
+**Paced, msg=int64: every row (median of the runs; latency from the scheduled time).**
+
+| P | rate | contestant | achieved | kept | cores | consumer | runtime | cores per 1M/s | p50 | p99 | p999 | most behind |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 5M | channel | 5.0M | 3/3 | 1.26 | 0.19 | 0.05 | 0.253 | 33.3 us | 65.3 us | 1.27 ms | 1680 |
+| 1 | 5M | parking | 5.0M | 3/3 | 2.00 | 0.99 | 0.00 | 0.400 | 243 ns | 6.0 us | 247.8 us | 1379 |
+| 1 | 5M | busyspin | 5.0M | 3/3 | 2.00 | 0.99 | 0.00 | 0.400 | 249 ns | 2.5 us | 45.6 us | 1298 |
+| 2 | 5M | channel | 5.0M | 3/3 | 2.19 | 0.22 | 0.07 | 0.439 | 36.6 us | 72.2 us | 109.6 us | 671 |
+| 2 | 5M | parking | 5.0M | 3/3 | 3.00 | 0.99 | 0.00 | 0.600 | 287 ns | 471 ns | 28.4 us | 815 |
+| 2 | 5M | busyspin | 5.0M | 3/3 | 3.00 | 1.00 | 0.00 | 0.600 | 311 ns | 547 ns | 21.1 us | 793 |
+| 4 | 5M | channel | 5.0M | 3/3 | 3.63 | 0.34 | 0.03 | 0.726 | 44.8 us | 143.4 us | 1.82 ms | 2438 |
+| 4 | 5M | parking | 5.0M | 3/3 | 5.00 | 1.00 | 0.00 | 0.999 | 293 ns | 465 ns | 12.9 us | 372 |
+| 4 | 5M | busyspin | 5.0M | 3/3 | 5.00 | 0.99 | 0.00 | 1.001 | 291 ns | 469 ns | 6.0 us | 342 |
+| 6 | 5M | channel | 5.0M | 3/3 | 4.83 | 0.37 | 0.03 | 0.966 | 57.9 us | 3.26 ms | 3.29 ms | 2766 |
+| 6 | 5M | parking | 5.0M | 3/3 | 7.00 | 0.99 | 0.00 | 1.400 | 299 ns | 473 ns | 6.7 us | 1327 |
+| 6 | 5M | busyspin | 5.0M | 3/3 | 6.98 | 0.99 | 0.00 | 1.396 | 295 ns | 159.7 us | 7.21 ms | 6920 |
+
+**Paced, msg=raw: every row (median of the runs; latency from the scheduled time).**
+
+| P | rate | contestant | achieved | kept | cores | consumer | runtime | cores per 1M/s | p50 | p99 | p999 | most behind |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 5M | channel | 5.0M | 3/3 | 1.45 | 0.38 | 0.04 | 0.289 | 35.1 us | 69.6 us | 161.8 us | 1621 |
+| 1 | 5M | parking | 5.0M | 3/3 | 2.00 | 0.99 | 0.00 | 0.400 | 271 ns | 6.8 us | 102.4 us | 1196 |
+| 1 | 5M | busyspin | 5.0M | 3/3 | 2.00 | 0.99 | 0.00 | 0.400 | 271 ns | 5.7 us | 64.8 us | 1625 |
+| 2 | 5M | channel | 5.0M | 3/3 | 2.28 | 0.47 | 0.03 | 0.456 | 41.5 us | 87.5 us | 261.1 us | 880 |
+| 2 | 5M | parking | 5.0M | 3/3 | 3.00 | 0.99 | 0.00 | 0.600 | 337 ns | 1.9 us | 142.3 us | 744 |
+| 2 | 5M | busyspin | 5.0M | 3/3 | 3.00 | 1.00 | 0.00 | 0.600 | 337 ns | 575 ns | 25.5 us | 729 |
+| 4 | 5M | channel | 5.0M | 3/3 | 3.25 | 0.67 | 0.01 | 0.650 | 123.9 us | 3.29 ms | 6.26 ms | 8522 |
+| 4 | 5M | parking | 5.0M | 3/3 | 5.00 | 0.99 | 0.00 | 1.000 | 317 ns | 527 ns | 3.2 us | 365 |
+| 4 | 5M | busyspin | 5.0M | 3/3 | 5.00 | 1.00 | 0.00 | 1.000 | 311 ns | 551 ns | 5.8 us | 357 |
+| 6 | 5M | channel | 5.0M | 3/3 | 3.10 | 0.54 | 0.01 | 0.621 | 119.3 us | 3.29 ms | 5.05 ms | 4699 |
+| 6 | 5M | parking | 5.0M | 3/3 | 7.00 | 0.99 | 0.00 | 1.399 | 339 ns | 563 ns | 5.6 us | 233 |
+| 6 | 5M | busyspin | 5.0M | 3/3 | 6.99 | 0.99 | 0.00 | 1.398 | 337 ns | 587 ns | 2.26 ms | 6391 |
+
+Open: why two producers on the shared sequencer are slower than one, and than four; the channel's paced latency with a
+producer that sleeps between sends instead of spinning; rates below 1M msg/s, where Parking parks.
+
 ## Pathways forward, ranked
 
 | # | Pathway                             | Evidence                             | Cost     | Status        |

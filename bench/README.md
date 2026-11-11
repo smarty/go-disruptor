@@ -14,6 +14,7 @@ variants in shuffled order across rounds, and compare with `benchstat`
 | `interleave`              | either  | Shuffled rounds per variant, then `environment.txt` and `benchstat`            |
 | `msr-prefetch`            | root    | Reads/writes Intel's prefetcher MSR (`0x1a4`), with the Golden Cove bit map    |
 | `prefetch/` (`PairChase`) | either  | Positive control: proves a prefetcher switch actually took effect              |
+| `chanvsring/`             | either  | A Go channel against go-disruptor, the hand-off alone; `rounds` runs it shuffled |
 
 ## The standard suite
 
